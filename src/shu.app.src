@@ -1,0 +1,9 @@
+{application, shu,
+             [{description, "Fixed schema, single file, high throughput durable data store"},
+              {vsn, "0.1.0"},
+              {licenses, ["Apache-2.0", "MPL-2.0"]},
+              {links, [{"github", "https://github.com/rabbitmq/shu"}]},
+              {modules, []},
+              {registered, []},
+              {applications, [kernel, stdlib]},
+              {env, []}]}.

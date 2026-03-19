@@ -1,0 +1,651 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2025 Broadcom. All Rights Reserved. The term Broadcom refers to Broadcom Inc. and/or its subsidiaries.
+%%
+-module(shu_SUITE).
+
+-compile(nowarn_export_all).
+-compile(export_all).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+all() ->
+    [{group, encoding},
+     {group, lifecycle},
+     {group, writes},
+     {group, reads},
+     {group, deletes},
+     {group, wal},
+     {group, compaction},
+     {group, batch},
+     {group, ra_integration}].
+
+groups() ->
+    [{encoding, [parallel],
+      [encode_decode_integer,
+       encode_decode_atom,
+       encode_decode_binary,
+       encode_decode_tuple,
+       encode_decode_undefined]},
+     {lifecycle, [],
+      [open_close,
+       open_close_reopen,
+       schema_mismatch,
+       reopen_preserves_atoms]},
+     {writes, [],
+      [write_single_low_freq,
+       write_single_high_freq,
+       write_multi_field,
+       write_new_key_allocates_slot,
+       write_overwrite_same_key,
+       write_undefined_nulls_field,
+       write_variable_length_keys]},
+     {reads, [],
+      [read_low_freq_from_file,
+       read_high_freq_from_wal,
+       read_all_fields,
+       read_not_found,
+       read_undefined_fields]},
+     {deletes, [],
+      [delete_key,
+       delete_and_reuse_slot,
+       delete_not_found]},
+     {wal, [],
+      [wal_replay_on_reopen,
+       wal_full_signal,
+       wal_count_dedup]},
+     {compaction, [],
+      [compact_two_phase,
+       compact_from_other_process,
+       compact_with_pending_writes]},
+     {batch, [],
+      [write_batch_multiple_keys,
+       write_batch_single_fsync,
+       write_batch_wal_full_continues]},
+     {ra_integration, [],
+      [ra_meta_atomic_term_and_vote,
+       ra_meta_variable_uid_keys,
+       ra_meta_election_cycle,
+       ra_meta_reopen_after_election]}].
+
+init_per_suite(Config) ->
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(_Group, _Config) ->
+    ok.
+
+init_per_testcase(TC, Config) ->
+    Dir = ?config(priv_dir, Config),
+    File = filename:join(Dir, atom_to_list(TC) ++ ".shu"),
+    [{shu_file, File} | Config].
+
+end_per_testcase(_TC, _Config) ->
+    ok.
+
+%%% ============================================================
+%%% Test schema used across tests
+%%% ============================================================
+
+ra_meta_schema() ->
+    #{fields => [
+        #{name => current_term, type => {integer, 64}, frequency => low},
+        #{name => voted_for, type => {tuple, [{atom, 255}, {atom, 255}]},
+          frequency => low},
+        #{name => last_applied, type => {integer, 64}, frequency => high}
+      ],
+      key => {binary, 16},
+      expected_count => 100}.
+
+make_key(N) ->
+    Bin = integer_to_binary(N),
+    Pad = 16 - byte_size(Bin),
+    <<0:(Pad * 8), Bin/binary>>.
+
+%%% ============================================================
+%%% Encoding tests
+%%% ============================================================
+
+encode_decode_integer(_Config) ->
+    Type = {integer, 64},
+    Encoded = shu:encode_value(Type, 42),
+    {42, <<>>} = shu:decode_value(Type, Encoded),
+    ?assertEqual(9, byte_size(Encoded)).
+
+encode_decode_atom(_Config) ->
+    Type = {atom, 255},
+    Encoded = shu:encode_value(Type, {atom_idx, 7}),
+    {{atom_idx, 7}, <<>>} = shu:decode_value(Type, Encoded),
+    ?assertEqual(3, byte_size(Encoded)).
+
+encode_decode_binary(_Config) ->
+    Type = {binary, 32},
+    Val = <<"hello world">>,
+    Encoded = shu:encode_value(Type, Val),
+    {Val, <<>>} = shu:decode_value(Type, Encoded),
+    ?assertEqual(1 + 2 + 32, byte_size(Encoded)).
+
+encode_decode_tuple(_Config) ->
+    Type = {tuple, [{atom, 255}, {atom, 255}]},
+    Val = {{atom_idx, 1}, {atom_idx, 2}},
+    Encoded = shu:encode_value(Type, Val),
+    {Val, <<>>} = shu:decode_value(Type, Encoded),
+    ?assertEqual(7, byte_size(Encoded)).
+
+encode_decode_undefined(_Config) ->
+    ?assertMatch({undefined, <<>>},
+                 shu:decode_value({integer, 64},
+                                  shu:encode_value({integer, 64}, undefined))),
+    ?assertMatch({undefined, <<>>},
+                 shu:decode_value({atom, 255},
+                                  shu:encode_value({atom, 255}, undefined))),
+    ?assertMatch({undefined, <<>>},
+                 shu:decode_value({binary, 16},
+                                  shu:encode_value({binary, 16}, undefined))),
+    ?assertMatch({undefined, <<>>},
+                 shu:decode_value({tuple, [{atom, 255}, {atom, 255}]},
+                                  shu:encode_value({tuple, [{atom, 255},
+                                                            {atom, 255}]},
+                                                   undefined))).
+
+%%% ============================================================
+%%% Lifecycle tests
+%%% ============================================================
+
+open_close(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, State} = shu:open(File, ra_meta_schema()),
+    Info = shu:info(State),
+    ?assertEqual(0, maps:get(slot_count, Info)),
+    ok = shu:close(State).
+
+open_close_reopen(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 5),
+    ok = shu:close(S1),
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, 5}, shu:read(S2, Key, current_term)),
+    ?assertEqual(1, maps:get(slot_count, shu:info(S2))),
+    ok = shu:close(S2).
+
+schema_mismatch(Config) ->
+    File = ?config(shu_file, Config),
+    Schema1 = ra_meta_schema(),
+    {ok, S0} = shu:open(File, Schema1),
+    ok = shu:close(S0),
+    Schema2 = #{fields => [
+                    #{name => foo, type => {integer, 64}, frequency => low}
+                ],
+                key => {binary, 16},
+                expected_count => 100},
+    ?assertMatch({error, schema_mismatch}, shu:open(File, Schema2)).
+
+reopen_preserves_atoms(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, [{current_term, 1},
+                                     {voted_for, {ra, 'ra@host'}}]),
+    ok = shu:close(S1),
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, {ra, 'ra@host'}}, shu:read(S2, Key, voted_for)),
+    ok = shu:close(S2).
+
+%%% ============================================================
+%%% Write tests
+%%% ============================================================
+
+write_single_low_freq(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, current_term, 42),
+    ?assertMatch({ok, 42}, shu:read(S1, Key, current_term)),
+    ok = shu:close(S1).
+
+write_single_high_freq(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, last_applied, 100),
+    ?assertMatch({ok, 100}, shu:read(S1, Key, last_applied)),
+    ok = shu:close(S1).
+
+write_multi_field(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, [{current_term, 3},
+                                     {voted_for, {node1, 'node1@host'}},
+                                     {last_applied, 99}]),
+    ?assertMatch({ok, 3}, shu:read(S1, Key, current_term)),
+    ?assertMatch({ok, {node1, 'node1@host'}}, shu:read(S1, Key, voted_for)),
+    ?assertMatch({ok, 99}, shu:read(S1, Key, last_applied)),
+    ok = shu:close(S1).
+
+write_new_key_allocates_slot(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S1} = shu:write(S0, K1, current_term, 1),
+    {ok, S2} = shu:write(S1, K2, current_term, 2),
+    ?assertEqual(2, maps:get(slot_count, shu:info(S2))),
+    ?assertMatch({ok, 1}, shu:read(S2, K1, current_term)),
+    ?assertMatch({ok, 2}, shu:read(S2, K2, current_term)),
+    ok = shu:close(S2).
+
+write_overwrite_same_key(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    {ok, S2} = shu:write(S1, Key, current_term, 2),
+    ?assertMatch({ok, 2}, shu:read(S2, Key, current_term)),
+    ?assertEqual(1, maps:get(slot_count, shu:info(S2))),
+    ok = shu:close(S2).
+
+write_undefined_nulls_field(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, [{current_term, 5},
+                                     {voted_for, {ra, 'ra@host'}},
+                                     {last_applied, 100}]),
+    ?assertMatch({ok, 5}, shu:read(S1, Key, current_term)),
+    ?assertMatch({ok, 100}, shu:read(S1, Key, last_applied)),
+    ?assertMatch({ok, {ra, 'ra@host'}}, shu:read(S1, Key, voted_for)),
+    %% null out low-freq integer field
+    {ok, S2} = shu:write(S1, Key, current_term, undefined),
+    ?assertMatch({ok, undefined}, shu:read(S2, Key, current_term)),
+    %% null out low-freq tuple field -- should return undefined, not {undefined, undefined}
+    {ok, S3} = shu:write(S2, Key, voted_for, undefined),
+    ?assertMatch({ok, undefined}, shu:read(S3, Key, voted_for)),
+    %% null out high-freq field
+    {ok, S4} = shu:write(S3, Key, last_applied, undefined),
+    ?assertMatch({ok, undefined}, shu:read(S4, Key, last_applied)),
+    %% record still exists
+    ?assertEqual(1, maps:get(slot_count, shu:info(S4))),
+    ok = shu:close(S4).
+
+write_variable_length_keys(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [#{name => value, type => {integer, 64},
+                             frequency => low}],
+               key => {binary, 24},
+               expected_count => 100},
+    {ok, S0} = shu:open(File, Schema),
+    Short = <<"ab">>,
+    Medium = <<"hello_world_key">>,
+    Long = <<"a]very]long]key]of]24by">>,
+    {ok, S1} = shu:write(S0, Short, value, 1),
+    {ok, S2} = shu:write(S1, Medium, value, 2),
+    {ok, S3} = shu:write(S2, Long, value, 3),
+    ?assertMatch({ok, 1}, shu:read(S3, Short, value)),
+    ?assertMatch({ok, 2}, shu:read(S3, Medium, value)),
+    ?assertMatch({ok, 3}, shu:read(S3, Long, value)),
+    ?assertEqual(3, maps:get(slot_count, shu:info(S3))),
+    %% reopen and verify
+    ok = shu:close(S3),
+    {ok, S4} = shu:open(File, Schema),
+    ?assertMatch({ok, 1}, shu:read(S4, Short, value)),
+    ?assertMatch({ok, 2}, shu:read(S4, Medium, value)),
+    ?assertMatch({ok, 3}, shu:read(S4, Long, value)),
+    ok = shu:close(S4).
+
+%%% ============================================================
+%%% Read tests
+%%% ============================================================
+
+read_low_freq_from_file(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 77),
+    ok = shu:close(S1),
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, 77}, shu:read(S2, Key, current_term)),
+    ok = shu:close(S2).
+
+read_high_freq_from_wal(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, last_applied, 500),
+    ?assertMatch({ok, 500}, shu:read(S1, Key, last_applied)),
+    ok = shu:close(S1).
+
+read_all_fields(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, [{current_term, 10},
+                                     {voted_for, {ra, 'ra@localhost'}},
+                                     {last_applied, 42}]),
+    {ok, All} = shu:read_all(S1, Key),
+    ?assertEqual(10, maps:get(current_term, All)),
+    ?assertEqual({ra, 'ra@localhost'}, maps:get(voted_for, All)),
+    ?assertEqual(42, maps:get(last_applied, All)),
+    ok = shu:close(S1).
+
+read_not_found(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    ?assertEqual(error, shu:read(S0, make_key(999), current_term)),
+    ok = shu:close(S0).
+
+read_undefined_fields(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    %% allocate slot with one field, leave others undefined
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    ?assertMatch({ok, undefined}, shu:read(S1, Key, last_applied)),
+    ok = shu:close(S1).
+
+%%% ============================================================
+%%% Delete tests
+%%% ============================================================
+
+delete_key(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, current_term, 5),
+    ?assertMatch({ok, 5}, shu:read(S1, Key, current_term)),
+    {ok, S2} = shu:delete(S1, Key),
+    ?assertEqual(error, shu:read(S2, Key, current_term)),
+    ?assertEqual(0, maps:get(slot_count, shu:info(S2))),
+    ok = shu:close(S2).
+
+delete_and_reuse_slot(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S1} = shu:write(S0, K1, current_term, 1),
+    {ok, S2} = shu:delete(S1, K1),
+    {ok, S3} = shu:write(S2, K2, current_term, 2),
+    ?assertEqual(1, maps:get(slot_count, shu:info(S3))),
+    ?assertMatch({ok, 2}, shu:read(S3, K2, current_term)),
+    ok = shu:close(S3).
+
+delete_not_found(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    ?assertMatch({error, not_found}, shu:delete(S0, make_key(999))),
+    ok = shu:close(S0).
+
+%%% ============================================================
+%%% WAL tests
+%%% ============================================================
+
+wal_replay_on_reopen(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    {ok, S2} = shu:write(S1, Key, last_applied, 999),
+    ok = shu:close(S2),
+    {ok, S3} = shu:open(File, Schema),
+    ?assertMatch({ok, 999}, shu:read(S3, Key, last_applied)),
+    ?assertMatch({ok, 1}, shu:read(S3, Key, current_term)),
+    ok = shu:close(S3).
+
+wal_full_signal(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [
+                   #{name => value, type => {integer, 64}, frequency => high}
+               ],
+               key => {binary, 4},
+               expected_count => 2},
+    {ok, S0} = shu:open(File, Schema),
+    Key = <<1, 2, 3, 4>>,
+    {Result, SF} = fill_wal(S0, Key, 0),
+    ?assertEqual(wal_full, Result),
+    ok = shu:close(SF).
+
+fill_wal(State, Key, N) ->
+    case shu:write(State, Key, value, N) of
+        {ok, S1} ->
+            fill_wal(S1, Key, N + 1);
+        {wal_full, S1} ->
+            {wal_full, S1}
+    end.
+
+wal_count_dedup(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, last_applied, 1),
+    {ok, S2} = shu:write(S1, Key, last_applied, 2),
+    {ok, S3} = shu:write(S2, Key, last_applied, 3),
+    %% wal_count should be 1 (one unique {slot, field} pair), not 3
+    ?assertEqual(1, maps:get(wal_count, shu:info(S3))),
+    ok = shu:close(S3).
+
+%%% ============================================================
+%%% Compaction tests
+%%% ============================================================
+
+compact_two_phase(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    {ok, S2} = shu:write(S1, Key, last_applied, 10),
+    {ok, S3} = shu:write(S2, Key, last_applied, 20),
+    {ok, S4} = shu:write(S3, Key, last_applied, 30),
+    {Work, S5} = shu:prepare_compact(S4),
+    ok = shu:do_compact(Work),
+    {ok, S6} = shu:finish_compact(ok, S5),
+    ?assertEqual(0, maps:get(wal_count, shu:info(S6))),
+    ?assertMatch({ok, 30}, shu:read(S6, Key, last_applied)),
+    ok = shu:close(S6).
+
+compact_from_other_process(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    {ok, S2} = shu:write(S1, Key, last_applied, 50),
+    {Work, S3} = shu:prepare_compact(S2),
+    Self = self(),
+    spawn_link(fun() ->
+                       Result = shu:do_compact(Work),
+                       Self ! {compact_done, Result}
+               end),
+    receive
+        {compact_done, ok} -> ok
+    after 5000 ->
+              ct:fail(compact_timeout)
+    end,
+    {ok, S4} = shu:finish_compact(ok, S3),
+    ?assertMatch({ok, 50}, shu:read(S4, Key, last_applied)),
+    ok = shu:close(S4).
+
+compact_with_pending_writes(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 1),
+    {ok, S2} = shu:write(S1, Key, last_applied, 10),
+    {Work, S3} = shu:prepare_compact(S2),
+    %% write while compacting -- goes to pending_wal
+    {ok, S4} = shu:write(S3, Key, last_applied, 99),
+    ok = shu:do_compact(Work),
+    {ok, S5} = shu:finish_compact(ok, S4),
+    %% pending write should survive compaction
+    ?assertMatch({ok, 99}, shu:read(S5, Key, last_applied)),
+    ok = shu:close(S5).
+
+%%% ============================================================
+%%% Batch tests
+%%% ============================================================
+
+write_batch_multiple_keys(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    K3 = make_key(3),
+    {ok, S1} = shu:write_batch(S0, [
+        {K1, [{current_term, 1}, {last_applied, 10}]},
+        {K2, [{current_term, 2}, {last_applied, 20}]},
+        {K3, [{current_term, 3}, {last_applied, 30}]}
+    ]),
+    ?assertEqual(3, maps:get(slot_count, shu:info(S1))),
+    ?assertMatch({ok, 1}, shu:read(S1, K1, current_term)),
+    ?assertMatch({ok, 20}, shu:read(S1, K2, last_applied)),
+    ?assertMatch({ok, 3}, shu:read(S1, K3, current_term)),
+    ok = shu:close(S1).
+
+write_batch_single_fsync(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    %% batch of 10 keys with low-freq writes should still work
+    Ops = [{make_key(N), [{current_term, N}]} || N <- lists:seq(1, 10)],
+    {ok, S1} = shu:write_batch(S0, Ops),
+    ?assertEqual(10, maps:get(slot_count, shu:info(S1))),
+    %% verify all written
+    lists:foreach(
+      fun(N) ->
+              ?assertMatch({ok, N}, shu:read(S1, make_key(N), current_term))
+      end, lists:seq(1, 10)),
+    ok = shu:close(S1).
+
+write_batch_wal_full_continues(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [
+                   #{name => value, type => {integer, 64}, frequency => high}
+               ],
+               key => {binary, 4},
+               expected_count => 10},
+    {ok, S0} = shu:open(File, Schema),
+    %% create many ops to overflow WAL
+    Ops = [{<<N:32>>, [{value, N}]} || N <- lists:seq(1, 10)],
+    %% write_batch should process all keys even if WAL fills up
+    Result = shu:write_batch(S0, Ops),
+    case Result of
+        {ok, S1} ->
+            ok = shu:close(S1);
+        {wal_full, S1} ->
+            %% all keys should still have been allocated
+            ?assert(maps:get(slot_count, shu:info(S1)) > 0),
+            ok = shu:close(S1)
+    end.
+
+%%% ============================================================
+%%% Ra integration tests
+%%%
+%%% These tests model the recommended ra_log_meta schema where
+%%% current_term and voted_for are combined into a single
+%%% term_and_vote tuple field for atomic writes. Keys are
+%%% variable-length ra_uid() binaries.
+%%% ============================================================
+
+ra_meta_integration_schema() ->
+    #{fields => [#{name => term_and_vote,
+                   type => {tuple, [{integer, 64},
+                                    {tuple, [{atom, 255},
+                                             {atom, 255}]}]},
+                   frequency => low},
+                 #{name => last_applied,
+                   type => {integer, 64},
+                   frequency => high}],
+      key => {binary, 24},
+      expected_count => 1000}.
+
+ra_meta_atomic_term_and_vote(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_integration_schema(),
+    Uid = <<"myra_abc123def456">>,
+    {ok, S0} = shu:open(File, Schema),
+    %% new term, no vote yet
+    {ok, S1} = shu:write(S0, Uid, term_and_vote, {1, undefined}),
+    ?assertMatch({ok, {1, undefined}}, shu:read(S1, Uid, term_and_vote)),
+    %% vote cast -- atomic update of term + vote
+    {ok, S2} = shu:write(S1, Uid, term_and_vote,
+                          {1, {ra, 'ra@node1'}}),
+    ?assertMatch({ok, {1, {ra, 'ra@node1'}}},
+                 shu:read(S2, Uid, term_and_vote)),
+    %% new term clears vote atomically
+    {ok, S3} = shu:write(S2, Uid, term_and_vote, {2, undefined}),
+    ?assertMatch({ok, {2, undefined}}, shu:read(S3, Uid, term_and_vote)),
+    ok = shu:close(S3).
+
+ra_meta_variable_uid_keys(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_integration_schema(),
+    %% ra_uid() is typically prefix (up to 6 bytes) + 12 random chars
+    Short = <<"ra_s1">>,
+    Medium = <<"myapp_abc123def456">>,
+    Long = <<"longprefix_abcdef123456">>,
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Short, term_and_vote, {1, undefined}),
+    {ok, S2} = shu:write(S1, Medium, term_and_vote, {2, undefined}),
+    {ok, S3} = shu:write(S2, Long, term_and_vote, {3, undefined}),
+    ?assertMatch({ok, {1, undefined}}, shu:read(S3, Short, term_and_vote)),
+    ?assertMatch({ok, {2, undefined}}, shu:read(S3, Medium, term_and_vote)),
+    ?assertMatch({ok, {3, undefined}}, shu:read(S3, Long, term_and_vote)),
+    ?assertEqual(3, maps:get(slot_count, shu:info(S3))),
+    ok = shu:close(S3).
+
+ra_meta_election_cycle(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_integration_schema(),
+    Uid = <<"ra_test_server1">>,
+    {ok, S0} = shu:open(File, Schema),
+    %% initial state: term 0, no vote, last_applied 0
+    {ok, S1} = shu:write(S0, Uid,
+                          [{term_and_vote, {0, undefined}},
+                           {last_applied, 0}]),
+    %% many last_applied updates (high frequency, no fsync)
+    S2 = lists:foldl(
+           fun(N, S) ->
+                   {ok, S_} = shu:write(S, Uid, last_applied, N),
+                   S_
+           end, S1, lists:seq(1, 100)),
+    ?assertMatch({ok, 100}, shu:read(S2, Uid, last_applied)),
+    %% election: term bumps, vote cast (low frequency, fsynced)
+    {ok, S3} = shu:write(S2, Uid, term_and_vote,
+                          {1, {ra, 'ra@node1'}}),
+    ?assertMatch({ok, {1, {ra, 'ra@node1'}}},
+                 shu:read(S3, Uid, term_and_vote)),
+    %% last_applied unaffected
+    ?assertMatch({ok, 100}, shu:read(S3, Uid, last_applied)),
+    ok = shu:close(S3).
+
+ra_meta_reopen_after_election(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_integration_schema(),
+    Uid = <<"ra_persist_test">>,
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Uid,
+                          [{term_and_vote, {5, {ra, 'ra@node2'}}},
+                           {last_applied, 42}]),
+    ok = shu:close(S1),
+    %% reopen -- term_and_vote is low-freq so it was fsynced
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, {5, {ra, 'ra@node2'}}},
+                 shu:read(S2, Uid, term_and_vote)),
+    %% last_applied was in WAL, should be recovered
+    ?assertMatch({ok, 42}, shu:read(S2, Uid, last_applied)),
+    ok = shu:close(S2).
