@@ -89,7 +89,8 @@ time and consists of five contiguous sections:
               ├──────────────────────────────────────┤
               │ WAL (Write-Ahead Log)                 │
               │   [0] slot_idx:u32 + field_id:u8 +   │
-              │       value:max_hf_size + seq:u64     │
+              │       value:max_hf_size + seq:u64 +   │
+              │       crc32:u32                       │
               │   [1] ...                             │
               │   [wal_capacity - 1] ...              │
               │   Fixed-size entries. Append-only     │
@@ -184,7 +185,7 @@ Its purpose is to avoid fsyncing high-frequency field writes on every operation.
 ### Entry Format
 
 ```
-slot_index:u32 | field_id:u8 | value:max_hf_field_size | seq:u64
+slot_index:u32 | field_id:u8 | value:max_hf_field_size | seq:u64 | crc32:u32
 ```
 
 - `slot_index` is the short-form record ID (not the full key), from the
@@ -194,14 +195,34 @@ slot_index:u32 | field_id:u8 | value:max_hf_field_size | seq:u64
   high-frequency field.
 - `seq` is a monotonically increasing sequence number. A `seq` of 0 indicates
   an empty/unused entry.
+- `crc32` is a 32-bit CRC computed over the slot_index, field_id, value, and
+  seq fields (everything except the CRC itself).
 
-There is no CRC on WAL entries. High-frequency fields are not fsynced, so a
-crash can leave partial writes. On recovery, entries with `seq > 0` are
-accepted; partial writes that corrupt `seq` to 0 are simply skipped, which is
-the correct behaviour -- the canonical value in the record slot (from the last
-compaction) remains valid.
+High-frequency fields are not fsynced, so a crash can leave partial (torn)
+writes. On recovery, entries with `seq > 0` and a valid CRC are accepted.
+Partial writes that corrupt the CRC are detected and skipped. If a torn write
+corrupts only the `seq` field (to 0) but leaves the CRC valid, the entry will
+be loaded; if both are corrupted, the CRC mismatch will cause the entry to be
+skipped, and the canonical value in the record slot (from the last compaction)
+remains valid.
 
 Entry size is fixed and determined by the schema at open time.
+
+### Crash Safety and Torn Writes
+
+WAL entries include a CRC32 checksum over the slot_index, field_id, value, and
+seq fields. During recovery, entries are only loaded if their CRC is valid.
+
+Since high-frequency fields are not fsynced, a crash during a WAL write can
+result in a "torn write" where the write is partially persisted. The CRC
+detects such corruptions:
+
+- If only the value is torn but seq and CRC are intact, the entry is loaded
+  with stale data (acceptable since the value will be overwritten by compaction).
+- If the CRC itself is corrupted, the entry is skipped and the canonical value
+  from the record slot is used instead (from the last successful compaction).
+- A crashed truncation leaves the file at the boundary, so recovery sees `eof`
+  and treats the WAL as empty (no stale entries from a partial compaction).
 
 ### WAL ETS Cache
 
@@ -245,7 +266,8 @@ I/O phase can run in a separate process:
 
 ### Phase 3: `finish_compact(Result, State) -> {ok, State}`
 
-- Zeros the WAL region on disk (in 4KB chunks to avoid large allocations).
+- Truncates the file to end at the WAL region boundary (atomic, crash-safe).
+- Fsyncs to durably persist the truncation.
 - Clears the WAL ETS table.
 - Replays `pending_wal` entries into the now-empty WAL.
 - Resets `wal_pos`, `wal_seq`, `wal_count`.

@@ -142,10 +142,10 @@ max_atom_bytes(_) -> 0.
 
 -spec compute_wal_entry_size([#field{}]) -> pos_integer().
 compute_wal_entry_size([]) ->
-    4 + 1 + 0 + 8;
+    4 + 1 + 0 + 8 + 4;
 compute_wal_entry_size(HighFreqFields) ->
     MaxFieldSize = lists:max([S || #field{size = S} <- HighFreqFields]),
-    4 + 1 + MaxFieldSize + 8.
+    4 + 1 + MaxFieldSize + 8 + 4.
 
 -spec compute_schema_crc([field_spec()], pos_integer()) -> non_neg_integer().
 compute_schema_crc(Fields, KeySize) ->
@@ -606,12 +606,18 @@ scan_wal(<<>>, _EntrySize, _Idx, _WalCap, State) ->
 scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
     <<Entry:EntrySize/binary, Rest/binary>> = Bin,
     <<SlotIdx:32/unsigned-big, FieldId:8, ValueAndMeta/binary>> = Entry,
-    ValueSize = EntrySize - 4 - 1 - 8,
-    <<Value:ValueSize/binary, Seq:64/unsigned-big>> = ValueAndMeta,
-    State1 = case Seq of
-                 0 ->
+    ValueSize = EntrySize - 4 - 1 - 8 - 4,
+    <<Value:ValueSize/binary, Seq:64/unsigned-big, StoredCrc:32/unsigned-big>> = ValueAndMeta,
+    %% Verify CRC: recompute over slot_idx, field_id, value, and seq
+    CrcData = <<SlotIdx:32/unsigned-big, FieldId:8,
+                Value/binary, Seq:64/unsigned-big>>,
+    ComputedCrc = erlang:crc32(CrcData),
+    State1 = case {Seq, ComputedCrc} of
+                 {0, _} ->
+                     %% Empty entry
                      State;
-                 _ ->
+                 {_, ComputedCrc} when ComputedCrc =:= StoredCrc ->
+                     %% CRC matches; this entry is valid
                      %% Skip WAL entries for slots that are marked
                      %% as deleted/free (e.g., freed slots from
                      %% delete operations)
@@ -639,7 +645,10 @@ scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
                                  false ->
                                      State
                              end
-                     end
+                     end;
+                 {_, _} ->
+                     %% CRC mismatch; torn write detected. Skip this entry.
+                     State
              end,
     scan_wal(Rest, EntrySize, Idx + 1, WalCap, State1);
 scan_wal(_, _EntrySize, _Idx, _WalCap, State) ->
@@ -821,11 +830,15 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
             {wal_full, State};
         false ->
             Seq = WalSeq + 1,
-            ValueSize = EntrySize - 4 - 1 - 8,
+            %% Entry format: slot_idx:u32 | field_id:u8 | value:N | seq:u64 | crc:u32
+            %% CRC is computed over slot_idx, field_id, value, and seq.
+            ValueSize = EntrySize - 4 - 1 - 8 - 4,
             PadSize = ValueSize - byte_size(Encoded),
             PaddedValue = <<Encoded/binary, 0:(PadSize * 8)>>,
-            Entry = <<SlotIdx:32/unsigned-big, FieldId:8,
-                      PaddedValue/binary, Seq:64/unsigned-big>>,
+            CrcData = <<SlotIdx:32/unsigned-big, FieldId:8,
+                        PaddedValue/binary, Seq:64/unsigned-big>>,
+            Crc = erlang:crc32(CrcData),
+            Entry = <<CrcData/binary, Crc:32/unsigned-big>>,
             EtsKey = {SlotIdx, FieldId},
             IsNew = case ets:lookup(Tab, EtsKey) of
                         [] -> true;
