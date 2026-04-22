@@ -591,6 +591,7 @@ recover_wal(Fd, #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize,
             State0
     end.
 
+
 scan_wal(<<>>, _EntrySize, _Idx, _WalCap, State) ->
     State;
 scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
@@ -602,24 +603,32 @@ scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
                  0 ->
                      State;
                  _ ->
-                     #shu{wal_tab = Tab, wal_seq = MaxSeq} = State,
-                     Key = {SlotIdx, FieldId},
-                     ShouldInsert =
-                         case ets:lookup(Tab, Key) of
-                             [{_, _, ExistingSeq}]
-                               when ExistingSeq >= Seq ->
-                                 false;
-                             _ ->
-                                 true
-                         end,
-                     case ShouldInsert of
+                     %% Skip WAL entries for slots that are marked as deleted/free
+                     %% (e.g., freed slots from delete operations)
+                     case lists:member(SlotIdx, State#shu.free_slots) of
                          true ->
-                             true = ets:insert(Tab, {Key, Value, Seq}),
-                             State#shu{wal_seq = max(MaxSeq, Seq),
-                                       wal_pos = max(State#shu.wal_pos,
-                                                     Idx + 1)};
+                             %% Slot is free, skip orphaned WAL entry
+                             State;
                          false ->
-                             State
+                             #shu{wal_tab = Tab, wal_seq = MaxSeq} = State,
+                             Key = {SlotIdx, FieldId},
+                             ShouldInsert =
+                                 case ets:lookup(Tab, Key) of
+                                     [{_, _, ExistingSeq}]
+                                       when ExistingSeq >= Seq ->
+                                         false;
+                                     _ ->
+                                         true
+                                 end,
+                             case ShouldInsert of
+                                 true ->
+                                     true = ets:insert(Tab, {Key, Value, Seq}),
+                                     State#shu{wal_seq = max(MaxSeq, Seq),
+                                               wal_pos = max(State#shu.wal_pos,
+                                                             Idx + 1)};
+                                 false ->
+                                     State
+                             end
                      end
              end,
     scan_wal(Rest, EntrySize, Idx + 1, WalCap, State1);
@@ -913,9 +922,6 @@ delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
                                         Acc
                                 end
                         end, 0, Cfg#cfg.fields),
-            %% TODO: Measure latency impact of synchronous file:sync/1 on every delete.
-            %% If high throughput deletions are expected, this sync could cause severe latency.
-            %% Consider making it configurable or relying on periodic/explicit sync/1 calls instead.
             ok = file:sync(Fd),
             {ok, State#shu{key_to_slot = maps:remove(Key, K2S),
                            free_slots = [SlotIdx | Free],
