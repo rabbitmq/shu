@@ -21,7 +21,8 @@
          prepare_compact/1,
          do_compact/1,
          finish_compact/2,
-         info/1]).
+         info/1,
+         migrate/2]).
 
 -ifdef(TEST).
 -export([encode_value/2,
@@ -304,8 +305,8 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
             PadSize = DataSize - Len,
             Entry = <<Len:16/unsigned-big, Bin/binary, 0:(PadSize * 8)>>,
             Pos = AtomOff + Idx * SlotSize,
-            ok = file:pwrite(Fd, Pos, Entry),
-            ok = file:sync(Fd),
+            ok = prim_file:pwrite(Fd, Pos, Entry),
+            ok = prim_file:sync(Fd),
             {ok, Idx, State#shu{atom_to_idx = A2I#{Atom => Idx},
                                 idx_to_atom = I2A#{Idx => Atom},
                                 atom_count = Count + 1}}
@@ -1109,6 +1110,96 @@ info(#shu{cfg = Cfg, slot_count = SC, atom_count = AC,
       wal_capacity => WalCap,
       wal_usage => WC / WalCap,
       compacting => Comp}.
+
+-spec migrate(state(), schema()) ->
+    {ok, state()} | {error, term()}.
+migrate(OldState, NewSchema) ->
+    %% Validate new schema
+    case validate_schema(NewSchema) of
+        {ok, NewCfg} ->
+            OldCfg = OldState#shu.cfg,
+            OldFilename = OldCfg#cfg.filename,
+            TempFilename = OldFilename ++ ".tmp",
+            do_migrate(OldState, OldFilename, TempFilename,
+                      NewCfg, NewSchema);
+        {error, _} = Err ->
+            Err
+    end.
+
+do_migrate(OldState, OldFilename, TempFilename, _NewCfg, NewSchema) ->
+    %% Close old state temporarily to avoid file conflicts
+    ok = file:sync(OldState#shu.fd),
+    try
+        %% Create new file with larger schema
+        case open(TempFilename, NewSchema) of
+            {ok, NewState} ->
+                %% Copy all entries from old to new
+                case copy_all_entries(OldState, NewState) of
+                    {ok, NewState2} ->
+                        %% Close both files
+                        ok = close(NewState2),
+                        %% Atomically swap files
+                        case prim_file:rename(TempFilename, OldFilename) of
+                            ok ->
+                                %% Reopen with new schema
+                                {ok, MigratedState} =
+                                    open(OldFilename, NewSchema),
+                                {ok, MigratedState};
+                            {error, Reason} ->
+                                {error, {rename_failed, Reason}}
+                        end;
+                    {error, Reason} ->
+                        _ = close(NewState),
+                        _ = prim_file:delete(TempFilename),
+                        {error, {copy_failed, Reason}}
+                end;
+            {error, Reason} ->
+                {error, {create_failed, Reason}}
+        end
+    catch
+        _:Error ->
+            _ = prim_file:delete(TempFilename),
+            {error, {migration_failed, Error}}
+    end.
+
+copy_all_entries(OldState, NewState) ->
+    %% Iterate all keys and copy their data
+    Entries = maps:to_list(OldState#shu.key_to_slot),
+    copy_entries_loop(Entries, OldState, NewState).
+
+copy_entries_loop([], _OldState, NewState) ->
+    {ok, NewState};
+copy_entries_loop([{Key, _SlotIdx} | Rest], OldState, NewState) ->
+    %% Read all fields for this key
+    case read_all(OldState, Key) of
+        {ok, Fields} ->
+            %% Convert fields map to list for write
+            FieldList = maps:to_list(Fields),
+            case write(NewState, Key, FieldList) of
+                {ok, NewState1} ->
+                    copy_entries_loop(Rest, OldState, NewState1);
+                {wal_full, NewState1} ->
+                    %% Compaction needed during migration
+                    {Work, NewState2} = prepare_compact(NewState1),
+                    case do_compact(Work) of
+                        ok ->
+                            case finish_compact(ok, NewState2) of
+                                {ok, NewState3} ->
+                                    copy_entries_loop(Rest, OldState,
+                                                     NewState3);
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        error ->
+            %% Key not found, shouldn't happen but continue
+            copy_entries_loop(Rest, OldState, NewState)
+    end.
 
 %%% ============================================================
 %%% Internal: flush pending WAL to disk
