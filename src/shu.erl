@@ -685,11 +685,14 @@ do_write_batch([], State, LowAcc, WalAcc, NeedSync, WalFull) ->
     State1 = case LowAcc of
                  [] -> State;
                  _ ->
-                     ok = file:pwrite(Fd, LowAcc),
+                     %% LowAcc is built in reverse, flatten lists and reverse to get correct order
+                     AllLow = lists:append(lists:reverse(LowAcc)),
+                     ok = file:pwrite(Fd, AllLow),
                      State
              end,
-    %% issue all WAL writes
-    {State2, WalFull2} = flush_wal_acc(WalAcc, State1, WalFull),
+    %% issue all WAL writes - WalAcc is also built in reverse
+    AllWal = lists:append(lists:reverse(WalAcc)),
+    {State2, WalFull2} = flush_wal_acc(AllWal, State1, WalFull),
     case NeedSync of
         true -> ok = file:sync(Fd);
         false -> ok
@@ -705,9 +708,11 @@ do_write_batch([{Key, FieldValues} | Rest], State0, LowAcc, WalAcc,
             Cfg = State1#shu.cfg,
             {NewLow, NewWal, State2, HasLow} =
                 classify_fields(Cfg, SlotIdx, FieldValues, State1),
+            %% Build accumulators as lists of lists, prepending (cons) instead of append
+            %% O(1) cons instead of O(N) append - will flatten at the end
             do_write_batch(Rest, State2,
-                           LowAcc ++ NewLow,
-                           WalAcc ++ NewWal,
+                           [NewLow | LowAcc],
+                           [NewWal | WalAcc],
                            NeedSync orelse HasLow,
                            WalFull);
         {error, _} = Err ->
