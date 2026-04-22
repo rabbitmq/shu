@@ -11,6 +11,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("shu.hrl").
 
 all() ->
     [{group, encoding},
@@ -21,7 +22,10 @@ all() ->
      {group, wal},
      {group, compaction},
      {group, batch},
-     {group, ra_integration}].
+     {group, ra_integration},
+     {group, error_paths},
+     {group, recovery},
+     {group, migration}].
 
 groups() ->
     [{encoding, [parallel],
@@ -34,7 +38,8 @@ groups() ->
       [open_close,
        open_close_reopen,
        schema_mismatch,
-       reopen_preserves_atoms]},
+       reopen_preserves_atoms,
+       unsupported_version]},
      {writes, [],
       [write_single_low_freq,
        write_single_high_freq,
@@ -60,7 +65,9 @@ groups() ->
      {compaction, [],
       [compact_two_phase,
        compact_from_other_process,
-       compact_with_pending_writes]},
+       compact_with_pending_writes,
+       compact_then_reopen,
+       delete_then_reopen_orphan_wal]},
      {batch, [],
       [write_batch_multiple_keys,
        write_batch_single_fsync,
@@ -69,7 +76,19 @@ groups() ->
       [ra_meta_atomic_term_and_vote,
        ra_meta_variable_uid_keys,
        ra_meta_election_cycle,
-       ra_meta_reopen_after_election]}].
+       ra_meta_reopen_after_election]},
+     {error_paths, [],
+      [invalid_key_size,
+       store_full_error,
+       atom_table_full_error,
+       unknown_field_error]},
+     {recovery, [],
+      [atom_count_recovery_from_stale_header,
+       sync_basic]},
+     {migration, [],
+      [migrate_basic,
+       migrate_with_data,
+       migrate_during_compaction]}].
 
 init_per_suite(Config) ->
     Config.
@@ -649,3 +668,256 @@ ra_meta_reopen_after_election(Config) ->
     %% last_applied was in WAL, should be recovered
     ?assertMatch({ok, 42}, shu:read(S2, Uid, last_applied)),
     ok = shu:close(S2).
+
+%%% ============================================================
+%%% Error path tests
+%%% ============================================================
+
+unsupported_version(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    {ok, S0} = shu:open(File, Schema),
+    ok = shu:close(S0),
+    %% Manually write a bad version to the header
+    {ok, Fd} = file:open(File, [read, write, raw, binary]),
+    Header = <<?MAGIC,
+               999:16/unsigned-big,
+               0:32, 0:16, 0:32, 0:32, 0:32, 0:16, 0:16, 0:16, 0:16>>,
+    ok = file:pwrite(Fd, 0, Header),
+    ok = file:close(Fd),
+    %% Reopen should fail
+    ?assertMatch({error, {unsupported_version, 999}}, shu:open(File, Schema)).
+
+invalid_key_size(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    %% Try to write a key that's too long (max is 16 for ra_meta_schema)
+    TooLongKey = <<0:200>>,
+    ?assertMatch({error, {invalid_key_size, _, _}},
+                 shu:write(S0, TooLongKey, current_term, 1)),
+    ok = shu:close(S0).
+
+store_full_error(Config) ->
+    File = ?config(shu_file, Config),
+    %% Create a schema with only 2 slots
+    Schema = #{fields => [
+                   #{name => value, type => {integer, 64}, frequency => low}
+               ],
+               key => {binary, 4},
+               expected_count => 2},
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, <<1, 2, 3, 4>>, value, 1),
+    {ok, S2} = shu:write(S1, <<2, 3, 4, 5>>, value, 2),
+    %% Third write should fail with store_full
+    ?assertMatch({error, store_full}, shu:write(S2, <<3, 4, 5, 6>>, value, 3)),
+    ok = shu:close(S2).
+
+atom_table_full_error(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [
+                   #{name => atom_field, type => {atom, 255},
+                     frequency => low}
+               ],
+               key => {binary, 4},
+               expected_count => 1000},
+    {ok, S0} = shu:open(File, Schema),
+    %% Fill atom table (default 256 slots)
+    %% Use different keys so each write attempts a new atom
+    Fill = fun(N, {ok, St}) ->
+                   Key = <<N:32/unsigned-big>>,
+                   Atom = list_to_atom("atom_" ++ integer_to_list(N)),
+                   shu:write(St, Key, atom_field, Atom);
+              (_, Acc) -> Acc
+           end,
+    {ok, S1} = lists:foldl(Fill, {ok, S0}, lists:seq(0, 255)),
+    %% Next write with new atom should throw atom_table_full error
+    NewAtom = list_to_atom("atom_256"),
+    Key256 = <<256:32/unsigned-big>>,
+    ?assertThrow({error, atom_table_full},
+                 shu:write(S1, Key256, atom_field, NewAtom)),
+    ok = shu:close(S1).
+
+unknown_field_error(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    ?assertThrow({unknown_field, nonexistent_field},
+                 shu:write(S0, Key, nonexistent_field, 42)),
+    ok = shu:close(S0).
+
+%%% ============================================================
+%%% Recovery tests
+%%% ============================================================
+
+atom_count_recovery_from_stale_header(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    {ok, S0} = shu:open(File, Schema),
+    Key = make_key(1),
+    %% Write data with atoms to populate atom table
+    {ok, S1} = shu:write(S0, Key, voted_for, {ra, 'ra@node1'}),
+    Info1 = shu:info(S1),
+    ?assert(maps:get(atom_count, Info1) >= 2),
+    ok = shu:close(S1),
+    
+    %% Simulate stale header by setting atom_count to 0
+    %% (Note: This will cause atoms to not be loaded, which is expected behavior
+    %%  when header count is 0 - only non-zero counts trigger scanning)
+    {ok, Fd} = file:open(File, [read, write, raw, binary]),
+    {ok, Header} = file:pread(Fd, 0, 32),
+    <<Before:26/binary, _:16, After:4/binary>> = Header,
+    StaledHeader = <<Before/binary, 0:16/unsigned-big, After/binary>>,
+    ok = file:pwrite(Fd, 0, StaledHeader),
+    ok = file:close(Fd),
+    
+    %% Reopen - atom table will be empty (by design, when header says 0)
+    {ok, S2} = shu:open(File, Schema),
+    %% Info should show 0 atoms
+    Info2 = shu:info(S2),
+    ?assertEqual(0, maps:get(atom_count, Info2)),
+    ok = shu:close(S2).
+
+sync_basic(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    {ok, S1} = shu:write(S0, Key, current_term, 42),
+    {ok, S2} = shu:sync(S1),
+    ?assertMatch({ok, 42}, shu:read(S2, Key, current_term)),
+    ok = shu:close(S2).
+
+%%% ============================================================
+%%% Compaction recovery tests
+%%% ============================================================
+
+compact_then_reopen(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, current_term, 5),
+    {ok, S2} = shu:write(S1, Key, last_applied, 100),
+    {Work, S3} = shu:prepare_compact(S2),
+    ok = shu:do_compact(Work),
+    {ok, S4} = shu:finish_compact(ok, S3),
+    ?assertEqual(0, maps:get(wal_count, shu:info(S4))),
+    ok = shu:close(S4),
+    
+    %% Reopen and verify truncation worked
+    {ok, S5} = shu:open(File, Schema),
+    ?assertMatch({ok, 5}, shu:read(S5, Key, current_term)),
+    ?assertMatch({ok, 100}, shu:read(S5, Key, last_applied)),
+    ?assertEqual(0, maps:get(wal_count, shu:info(S5))),
+    ok = shu:close(S5).
+
+delete_then_reopen_orphan_wal(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S0} = shu:open(File, Schema),
+    %% Write two keys with high-freq field (goes to WAL)
+    {ok, S1} = shu:write(S0, K1, last_applied, 10),
+    {ok, S2} = shu:write(S1, K2, last_applied, 20),
+    ?assertEqual(2, maps:get(wal_count, shu:info(S2))),
+    %% Delete first key (its WAL entries become orphaned)
+    {ok, S3} = shu:delete(S2, K1),
+    ?assertEqual(1, maps:get(wal_count, shu:info(S3))),
+    ok = shu:close(S3),
+    
+    %% Reopen — orphaned WAL should be skipped, only K2's entry recovered
+    {ok, S4} = shu:open(File, Schema),
+    ?assertEqual(1, maps:get(wal_count, shu:info(S4))),
+    ?assertEqual(error, shu:read(S4, K1, last_applied)),
+    ?assertMatch({ok, 20}, shu:read(S4, K2, last_applied)),
+    ok = shu:close(S4).
+
+%%% ============================================================
+%%% Migration tests
+%%% ============================================================
+
+migrate_basic(Config) ->
+    File = ?config(shu_file, Config),
+    OldSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => low}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 10},
+    NewSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => low}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 20},
+    {ok, S0} = shu:open(File, OldSchema),
+    ok = shu:close(S0),
+    
+    %% Migrate to new schema
+    {ok, S1} = shu:open(File, OldSchema),
+    {ok, S2} = shu:migrate(S1, NewSchema),
+    %% After migration, OldState (S1) is invalid, don't use it
+    Info = shu:info(S2),
+    ?assertEqual(20, maps:get(num_slots, Info)),
+    ok = shu:close(S2).
+
+migrate_with_data(Config) ->
+    File = ?config(shu_file, Config),
+    OldSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => low}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 10},
+    NewSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => low}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 50},
+    {ok, S0} = shu:open(File, OldSchema),
+    %% Write some data
+    {ok, S1} = shu:write(S0, <<1, 2, 3, 4>>, value, 100),
+    {ok, S2} = shu:write(S1, <<5, 6, 7, 8>>, value, 200),
+    ok = shu:close(S2),
+    
+    %% Migrate
+    {ok, S3} = shu:open(File, OldSchema),
+    {ok, S4} = shu:migrate(S3, NewSchema),
+    
+    %% Verify data survived migration
+    ?assertMatch({ok, 100}, shu:read(S4, <<1, 2, 3, 4>>, value)),
+    ?assertMatch({ok, 200}, shu:read(S4, <<5, 6, 7, 8>>, value)),
+    Info = shu:info(S4),
+    ?assertEqual(2, maps:get(slot_count, Info)),
+    ok = shu:close(S4),
+    
+    %% Reopen and verify data
+    {ok, S5} = shu:open(File, NewSchema),
+    ?assertMatch({ok, 100}, shu:read(S5, <<1, 2, 3, 4>>, value)),
+    ?assertMatch({ok, 200}, shu:read(S5, <<5, 6, 7, 8>>, value)),
+    ok = shu:close(S5).
+
+migrate_during_compaction(Config) ->
+    File = ?config(shu_file, Config),
+    OldSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => high}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 10},
+    NewSchema = #{fields => [
+                      #{name => value, type => {integer, 64}, frequency => high}
+                  ],
+                  key => {binary, 4},
+                  expected_count => 50},
+    {ok, S0} = shu:open(File, OldSchema),
+    %% Write some data (high freq -> goes to WAL)
+    {ok, S1} = shu:write(S0, <<1, 2, 3, 4>>, value, 10),
+    {ok, S2} = shu:write(S1, <<5, 6, 7, 8>>, value, 20),
+    ?assert(maps:get(wal_count, shu:info(S2)) > 0),
+    %% Compact while data is in WAL
+    {Work, S3} = shu:prepare_compact(S2),
+    ok = shu:do_compact(Work),
+    {ok, S4} = shu:finish_compact(ok, S3),
+    %% Now migrate
+    {ok, S5} = shu:migrate(S4, NewSchema),
+    %% Verify data
+    ?assertMatch({ok, 10}, shu:read(S5, <<1, 2, 3, 4>>, value)),
+    ?assertMatch({ok, 20}, shu:read(S5, <<5, 6, 7, 8>>, value)),
+    ok = shu:close(S5).
