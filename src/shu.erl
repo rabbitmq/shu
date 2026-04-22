@@ -225,16 +225,19 @@ encode_resolving_atoms({atom, MaxBytes}, Atom, State) when is_atom(Atom) ->
             throw(Err)
     end;
 encode_resolving_atoms({tuple, Types}, undefined, State) ->
-    InnerSize = lists:sum([type_size(T) || T <- Types]),
-    {<<0:8, 0:(InnerSize * 8)>>, State};
-encode_resolving_atoms({tuple, Types}, Value, State) when is_tuple(Value) ->
+    {encode_value({tuple, Types}, undefined), State};
+encode_resolving_atoms({tuple, Types}, Value, State)
+  when is_tuple(Value) ->
     Elements = tuple_to_list(Value),
-    {Bins, State1} =
+    {BinsRev, State1} =
         lists:foldl(fun({T, V}, {Acc, S}) ->
                             {B, S1} = encode_resolving_atoms(T, V, S),
                             {[B | Acc], S1}
                     end, {[], State}, lists:zip(Types, Elements)),
-    {<<1:8, (list_to_binary(lists:reverse(Bins)))/binary>>, State1};
+    %% Build binary directly from reversed list to avoid list_to_binary
+    %% overhead of reversing again
+    Inner = iolist_to_binary(lists:reverse(BinsRev)),
+    {<<1:8, Inner/binary>>, State1};
 encode_resolving_atoms(Type, Value, State) ->
     {encode_value(Type, Value), State}.
 
