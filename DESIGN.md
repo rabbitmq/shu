@@ -141,6 +141,20 @@ Field list order determines on-disk layout. Field offsets and sizes are
 precomputed at open time and stored in `#cfg.field_map` for O(1) lookup by
 name.
 
+### File Format Versioning
+
+The file header includes a 16-bit version field. The current version is 1.
+On open, the version is validated; files with a different version are
+rejected with `{error, {unsupported_version, Version}}`.
+
+This allows for future format evolution:
+- **Version 1**: Current format (CRC on WAL entries, atomically truncated WAL).
+- **Future versions**: Can introduce new features (e.g., compression, different
+  compaction strategy) without risking silent corruption of old files.
+
+To upgrade a file format, use the `migrate/2` API to rewrite data into a new
+file with the target format version.
+
 ### Frequency
 
 - **`low`** -- written infrequently, durability required. Written directly to
