@@ -302,6 +302,7 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
             Entry = <<Len:16/unsigned-big, Bin/binary, 0:(PadSize * 8)>>,
             Pos = AtomOff + Idx * SlotSize,
             ok = file:pwrite(Fd, Pos, Entry),
+            ok = file:sync(Fd),
             {ok, Idx, State#shu{atom_to_idx = A2I#{Atom => Idx},
                                 idx_to_atom = I2A#{Idx => Atom},
                                 atom_count = Count + 1}}
@@ -314,10 +315,18 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
 load_atom_table(_Fd, _Cfg, 0) ->
     {#{}, #{}, 0};
 load_atom_table(Fd, #cfg{atom_slot_size = SlotSize,
-                          atom_table_offset = AtomOff}, AtomCount) ->
-    TotalSize = AtomCount * SlotSize,
+                          atom_table_offset = AtomOff,
+                          atom_table_slots = AtomTableSlots}, HeaderAtomCount) ->
+    %% Read all atom table slots to find the actual count
+    %% (in case header count is stale due to crash during add_atom)
+    TotalSize = AtomTableSlots * SlotSize,
     {ok, Bin} = file:pread(Fd, AtomOff, TotalSize),
-    parse_atom_table(Bin, SlotSize, 0, AtomCount, #{}, #{}).
+    %% Find first empty slot (Len=0) or use HeaderAtomCount as fallback
+    ActualCount = find_atom_table_boundary(Bin, SlotSize, 0, HeaderAtomCount, AtomTableSlots),
+    %% Now parse up to the actual count
+    ParseSize = ActualCount * SlotSize,
+    <<ParseBin:ParseSize/binary, _/binary>> = Bin,
+    parse_atom_table(ParseBin, SlotSize, 0, ActualCount, #{}, #{}).
 
 parse_atom_table(_Bin, _SlotSize, Idx, AtomCount, A2I, I2A)
   when Idx >= AtomCount ->
@@ -329,6 +338,23 @@ parse_atom_table(Bin, SlotSize, Idx, AtomCount, A2I, I2A) ->
     Atom = binary_to_atom(AtomBin, utf8),
     parse_atom_table(Rest, SlotSize, Idx + 1, AtomCount,
                      A2I#{Atom => Idx}, I2A#{Idx => Atom}).
+
+find_atom_table_boundary(_Bin, _SlotSize, Idx, MaxIdx, TableSlots)
+  when Idx >= MaxIdx orelse Idx >= TableSlots ->
+    %% Reached header count or table limit without finding empty slot
+    Idx;
+find_atom_table_boundary(Bin, SlotSize, Idx, MaxIdx, TableSlots) ->
+    %% Check if this slot is empty (first 2 bytes = 0 means Len=0)
+    <<Entry:SlotSize/binary, Rest/binary>> = Bin,
+    <<Len:16/unsigned-big, _/binary>> = Entry,
+    case Len of
+        0 ->
+            %% Found first empty slot, actual count is Idx
+            Idx;
+        _ ->
+            %% Slot occupied, continue scanning
+            find_atom_table_boundary(Rest, SlotSize, Idx + 1, MaxIdx, TableSlots)
+    end.
 
 %%% ============================================================
 %%% File addressing helpers
@@ -547,11 +573,20 @@ recover_wal(Fd, #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize,
             State0) ->
     TotalSize = WalCap * EntrySize,
     if TotalSize > 0 ->
-            {ok, Bin} = file:pread(Fd, WalOff, TotalSize),
-            State1 = scan_wal(Bin, EntrySize, 0, WalCap, State0),
-            %% wal_count must reflect actual unique ETS entries
-            WalCount = ets:info(State1#shu.wal_tab, size),
-            State1#shu{wal_count = WalCount};
+            case file:pread(Fd, WalOff, TotalSize) of
+                {ok, Bin} ->
+                    State1 = scan_wal(Bin, EntrySize, 0, WalCap, State0),
+                    %% wal_count must reflect actual unique ETS entries
+                    WalCount = ets:info(State1#shu.wal_tab, size),
+                    State1#shu{wal_count = WalCount};
+                eof ->
+                    %% File was truncated (e.g., after successful compaction).
+                    %% WAL region does not exist; no entries to recover.
+                    State0;
+                {error, _} ->
+                    %% File read error; treat as no WAL to recover.
+                    State0
+            end;
        true ->
             State0
     end.
@@ -956,9 +991,10 @@ finish_compact({error, _} = Err, _State) ->
     Err;
 finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
                          pending_wal = Pending} = State) ->
-    #cfg{wal_offset = WalOff, wal_capacity = WalCap,
-         wal_entry_size = EntrySize} = Cfg,
-    zero_region(Fd, WalOff, WalCap * EntrySize),
+    #cfg{wal_offset = WalOff} = Cfg,
+    {ok, _} = file:position(Fd, WalOff),
+    ok = file:truncate(Fd),
+    ok = file:sync(Fd),
     true = ets:delete_all_objects(Tab),
     ReversedPending = lists:reverse(Pending),
     State1 = State#shu{wal_pos = 0, wal_seq = 0,
@@ -967,20 +1003,6 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
     State2 = replay_pending_wal(ReversedPending, Cfg, Fd, Tab, State1),
     ok = file:sync(Fd),
     {ok, State2}.
-
-zero_region(Fd, Offset, Size) ->
-    Chunk = <<0:(?WAL_ZERO_CHUNK * 8)>>,
-    zero_region(Fd, Offset, Size, ?WAL_ZERO_CHUNK, Chunk).
-
-zero_region(_Fd, _Offset, Remaining, _ChunkSize, _Chunk) when Remaining =< 0 ->
-    ok;
-zero_region(Fd, Offset, Remaining, ChunkSize, Chunk) ->
-    WriteSize = min(Remaining, ChunkSize),
-    Bin = if WriteSize == ChunkSize -> Chunk;
-             true -> <<0:(WriteSize * 8)>>
-          end,
-    ok = file:pwrite(Fd, Offset, Bin),
-    zero_region(Fd, Offset + WriteSize, Remaining - WriteSize, ChunkSize, Chunk).
 
 replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
     #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize} = Cfg,
