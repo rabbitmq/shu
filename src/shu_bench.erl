@@ -18,8 +18,8 @@ run(N) ->
     io:format("~n=== Starting Benchmark with N = ~p ===~n", [N]),
 
     %% Cleanup previous runs
-    file:delete(?SHU_FILE),
-    file:delete(?DETS_FILE),
+    _ = file:delete(?SHU_FILE),
+    _ = file:delete(?DETS_FILE),
 
     %% 1. Setup
     Schema = #{fields => [
@@ -132,11 +132,11 @@ run(N) ->
     print_result("DETS Mixed", DetsMixedTime, N),
 
     %% Teardown
-    shu:close(Shu6),
-    dets:close(Dets),
+    ok = shu:close(Shu6),
+    ok = dets:close(Dets),
 
-    file:delete(?SHU_FILE),
-    file:delete(?DETS_FILE),
+    _ = file:delete(?SHU_FILE),
+    _ = file:delete(?DETS_FILE),
     ok.
 
 print_result(Name, Microsecs, N) ->

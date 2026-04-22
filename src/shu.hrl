@@ -77,13 +77,6 @@
               compacting = false :: boolean(),
               pending_wal = [] :: [iodata()]}).
 
--type compact_work() :: #{filename := file:filename_all(),
-                          cfg := #cfg{},
-                          entries := [{{non_neg_integer(),
-                                        non_neg_integer()},
-                                       binary(),
-                                       non_neg_integer()}],
-                          atom_to_idx := #{atom() => non_neg_integer()},
-                          idx_to_atom := #{non_neg_integer() => atom()}}.
+-opaque compact_work() :: map().
 
 -type compact_result() :: ok | {error, term()}.

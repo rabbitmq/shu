@@ -973,6 +973,13 @@ delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
 %%% ============================================================
 
 -spec sync(state()) -> {ok, state()} | {error, term()}.
+sync(#shu{fd = Fd, compacting = true} = State) ->
+    %% During compaction, flush pending WAL entries to disk
+    State1 = flush_pending_wal(State),
+    case file:sync(Fd) of
+        ok -> {ok, State1};
+        {error, _} = Err -> Err
+    end;
 sync(#shu{fd = Fd} = State) ->
     case file:sync(Fd) of
         ok -> {ok, State};
@@ -1000,16 +1007,13 @@ do_compact(#{filename := Filename, cfg := Cfg,
              entries := Entries}) ->
     {ok, Fd} = file:open(Filename, [read, write, raw, binary]),
     try
+        %% Build a map for O(1) field lookups instead of O(N*M) linear search
+        FieldMap = maps:from_list(
+                     [{FieldId, Field} ||
+                      #field{id = FieldId} = Field <- Cfg#cfg.fields]),
         PWrites = lists:filtermap(
                     fun({{SlotIdx, FieldId}, ValueBin, _Seq}) ->
-                            %% TODO: Measure performance impact of
-                            %% O(N*M) linear search here.
-                            %% If this becomes a bottleneck with
-                            %% many fields and large WAL capacity,
-                            %% consider building a map of
-                            %% FieldId -> Field before the
-                            %% filtermap loop to make the lookup O(1).
-                            case find_field_by_id(FieldId, Cfg#cfg.fields) of
+                            case maps:find(FieldId, FieldMap) of
                                 {ok, #field{size = Size} = Field} ->
                                     Pos = field_pos(Cfg, SlotIdx, Field),
                                     Bin = fit_to_size(ValueBin, Size),
@@ -1018,9 +1022,11 @@ do_compact(#{filename := Filename, cfg := Cfg,
                                     false
                             end
                     end, Entries),
-        case PWrites of
+        %% Sort pwrite operations by position for better I/O locality
+        SortedWrites = lists:keysort(1, PWrites),
+        case SortedWrites of
             [] -> ok;
-            _ -> ok = file:pwrite(Fd, PWrites)
+            _ -> ok = file:pwrite(Fd, SortedWrites)
         end,
         ok = file:sync(Fd),
         ok
@@ -1077,12 +1083,6 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
         _ -> ok = file:pwrite(Fd, lists:reverse(PWrites))
     end,
     State1.
-
-find_field_by_id(FieldId, Fields) ->
-    case lists:keyfind(FieldId, #field.id, Fields) of
-        false -> error;
-        F -> {ok, F}
-    end.
 
 fit_to_size(Bin, Size) ->
     case byte_size(Bin) of
