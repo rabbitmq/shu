@@ -314,15 +314,19 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
      non_neg_integer()}.
 load_atom_table(_Fd, _Cfg, 0) ->
     {#{}, #{}, 0};
-load_atom_table(Fd, #cfg{atom_slot_size = SlotSize,
-                          atom_table_offset = AtomOff,
-                          atom_table_slots = AtomTableSlots}, HeaderAtomCount) ->
+load_atom_table(Fd,
+                #cfg{atom_slot_size = SlotSize,
+                     atom_table_offset = AtomOff,
+                     atom_table_slots = AtomTableSlots},
+                HeaderAtomCount) ->
     %% Read all atom table slots to find the actual count
     %% (in case header count is stale due to crash during add_atom)
     TotalSize = AtomTableSlots * SlotSize,
     {ok, Bin} = file:pread(Fd, AtomOff, TotalSize),
     %% Find first empty slot (Len=0) or use HeaderAtomCount as fallback
-    ActualCount = find_atom_table_boundary(Bin, SlotSize, 0, HeaderAtomCount, AtomTableSlots),
+    ActualCount = find_atom_table_boundary(Bin, SlotSize, 0,
+                                           HeaderAtomCount,
+                                           AtomTableSlots),
     %% Now parse up to the actual count
     ParseSize = ActualCount * SlotSize,
     <<ParseBin:ParseSize/binary, _/binary>> = Bin,
@@ -353,7 +357,8 @@ find_atom_table_boundary(Bin, SlotSize, Idx, MaxIdx, TableSlots) ->
             Idx;
         _ ->
             %% Slot occupied, continue scanning
-            find_atom_table_boundary(Rest, SlotSize, Idx + 1, MaxIdx, TableSlots)
+            find_atom_table_boundary(Rest, SlotSize, Idx + 1, MaxIdx,
+                                     TableSlots)
     end.
 
 %%% ============================================================
@@ -603,8 +608,9 @@ scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
                  0 ->
                      State;
                  _ ->
-                     %% Skip WAL entries for slots that are marked as deleted/free
-                     %% (e.g., freed slots from delete operations)
+                     %% Skip WAL entries for slots that are marked
+                     %% as deleted/free (e.g., freed slots from
+                     %% delete operations)
                      case lists:member(SlotIdx, State#shu.free_slots) of
                          true ->
                              %% Slot is free, skip orphaned WAL entry
@@ -666,12 +672,11 @@ do_write_batch([], State, LowAcc, WalAcc, NeedSync, WalFull) ->
     State1 = case LowAcc of
                  [] -> State;
                  _ ->
-                     ok = file:pwrite(Fd, lists:reverse(LowAcc)),
+                     ok = file:pwrite(Fd, LowAcc),
                      State
              end,
     %% issue all WAL writes
-    {State2, WalFull2} = flush_wal_acc(lists:reverse(WalAcc),
-                                        State1, WalFull),
+    {State2, WalFull2} = flush_wal_acc(WalAcc, State1, WalFull),
     case NeedSync of
         true -> ok = file:sync(Fd);
         false -> ok
@@ -688,8 +693,8 @@ do_write_batch([{Key, FieldValues} | Rest], State0, LowAcc, WalAcc,
             {NewLow, NewWal, State2, HasLow} =
                 classify_fields(Cfg, SlotIdx, FieldValues, State1),
             do_write_batch(Rest, State2,
-                           NewLow ++ LowAcc,
-                           NewWal ++ WalAcc,
+                           LowAcc ++ NewLow,
+                           WalAcc ++ NewWal,
                            NeedSync orelse HasLow,
                            WalFull);
         {error, _} = Err ->
@@ -713,7 +718,8 @@ classify_fields(Cfg, SlotIdx, FieldValues, State) ->
       end, {[], [], State, false}, FieldValues).
 
 flush_wal_acc(WalWrites, State, WalFull) ->
-    {State1, WalFull1, PWrites} = flush_wal_acc_loop(WalWrites, State, WalFull, []),
+    {State1, WalFull1, PWrites} =
+        flush_wal_acc_loop(WalWrites, State, WalFull, []),
     case PWrites of
         [] -> ok;
         _ -> ok = file:pwrite(State1#shu.fd, lists:reverse(PWrites))
@@ -861,17 +867,44 @@ read(#shu{key_to_slot = K2S, cfg = Cfg} = State, Key, FieldName) ->
 
 -spec read_all(state(), Key :: binary()) ->
     {ok, #{atom() => term()}} | error.
-read_all(#shu{key_to_slot = K2S, cfg = #cfg{fields = Fields}} = State, Key) ->
+read_all(#shu{key_to_slot = K2S,
+              cfg = #cfg{fields = Fields,
+                        record_size = RecordSize} = Cfg,
+              fd = Fd} = State,
+         Key) ->
     case K2S of
         #{Key := SlotIdx} ->
-            Result = lists:foldl(
-                       fun(#field{name = Name} = F, Acc) ->
-                               case read_field(SlotIdx, F, State) of
-                                   {ok, Value} -> Acc#{Name => Value};
-                                   error -> Acc
-                               end
-                       end, #{}, Fields),
-            {ok, Result};
+            %% Read entire record at once for efficiency
+            Pos = record_pos(Cfg, SlotIdx),
+            case file:pread(Fd, Pos, RecordSize) of
+                {ok, RecordBin} ->
+                    Result = lists:foldl(
+                        fun(#field{name = Name, frequency = high} = F,
+                            Acc) ->
+                                %% High-frequency fields might be in
+                                %% WAL/ETS, check there first
+                                case read_field(SlotIdx, F, State) of
+                                    {ok, Value} ->
+                                        Acc#{Name => Value};
+                                    error ->
+                                        Acc
+                                end;
+                           (#field{name = Name,
+                                   offset = FieldOffset,
+                                   size = FieldSize} = F,
+                            Acc) ->
+                                %% Low-frequency fields are in record
+                                <<_:FieldOffset/binary,
+                                  FieldBin:FieldSize/binary,
+                                  _/binary>> = RecordBin,
+                                {Decoded, _} =
+                                    decode_field_value(F, FieldBin, State),
+                                Acc#{Name => Decoded}
+                        end, #{}, Fields),
+                    {ok, Result};
+                {error, _} ->
+                    error
+            end;
         _ ->
             error
     end.
@@ -965,10 +998,13 @@ do_compact(#{filename := Filename, cfg := Cfg,
     try
         PWrites = lists:filtermap(
                     fun({{SlotIdx, FieldId}, ValueBin, _Seq}) ->
-                            %% TODO: Measure performance impact of O(N*M) linear search here.
-                            %% If this becomes a bottleneck with many fields and large WAL capacity,
-                            %% consider building a map of FieldId -> Field before the filtermap loop
-                            %% to make the lookup O(1).
+                            %% TODO: Measure performance impact of
+                            %% O(N*M) linear search here.
+                            %% If this becomes a bottleneck with
+                            %% many fields and large WAL capacity,
+                            %% consider building a map of
+                            %% FieldId -> Field before the
+                            %% filtermap loop to make the lookup O(1).
                             case find_field_by_id(FieldId, Cfg#cfg.fields) of
                                 {ok, #field{size = Size} = Field} ->
                                     Pos = field_pos(Cfg, SlotIdx, Field),
@@ -1018,8 +1054,7 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
                   #shu{wal_pos = WalPos, wal_count = WC} = S,
                   ActualPos = WalPos rem WalCap,
                   FilePos = wal_entry_pos(Cfg, ActualPos),
-                  EntryBin = iolist_to_binary(Entry),
-                  <<SlotIdx:32/unsigned-big, FieldId:8, ValueAndMeta/binary>> = EntryBin,
+                  <<SlotIdx:32/unsigned-big, FieldId:8, ValueAndMeta/binary>> = Entry,
                   ValueSize = EntrySize - 4 - 1 - 8,
                   <<Value:ValueSize/binary, Seq:64/unsigned-big>> = ValueAndMeta,
                   EtsKey = {SlotIdx, FieldId},
@@ -1031,7 +1066,7 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
                                                    true -> 1;
                                                    false -> 0
                                                end)},
-                  {S1, [{FilePos, EntryBin} | Acc]}
+                  {S1, [{FilePos, Entry} | Acc]}
           end, {State, []}, Pending),
     case PWrites of
         [] -> ok;
@@ -1088,7 +1123,7 @@ flush_pending_wal(#shu{pending_wal = Pending, cfg = Cfg, fd = Fd,
           fun(Entry, {Pos, Acc}) ->
                   ActualPos = Pos rem WalCap,
                   FilePos = wal_entry_pos(Cfg, ActualPos),
-                  {Pos + 1, [{FilePos, iolist_to_binary(Entry)} | Acc]}
+                  {Pos + 1, [{FilePos, Entry} | Acc]}
           end, {WalPos0, []}, ReversedPending),
     case PWrites of
         [] -> ok;
