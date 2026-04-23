@@ -252,8 +252,14 @@ decode_resolving_atoms({atom, MaxBytes}, Bin, State) ->
     case Val of
         undefined -> {undefined, Rest};
         {atom_idx, Idx} ->
-            #{Idx := Atom} = State#shu.idx_to_atom,
-            {Atom, Rest}
+            case State#shu.idx_to_atom of
+                #{Idx := Atom} ->
+                    {Atom, Rest};
+                _ ->
+                    %% Atom table is corrupted or atom was not persisted.
+                    %% Return undefined as a safe fallback rather than crashing.
+                    {undefined, Rest}
+            end
     end;
 decode_resolving_atoms({tuple, Types}, Bin, State) ->
     InnerSize = lists:sum([type_size(T) || T <- Types]),
@@ -901,30 +907,39 @@ read_all(#shu{key_to_slot = K2S,
             Pos = record_pos(Cfg, SlotIdx),
             case file:pread(Fd, Pos, RecordSize) of
                 {ok, RecordBin} ->
-                    Result = lists:foldl(
-                        fun(#field{name = Name, frequency = high} = F,
-                            Acc) ->
-                                %% High-frequency fields might be in
-                                %% WAL/ETS, check there first
-                                case read_field(SlotIdx, F, State) of
-                                    {ok, Value} ->
-                                        Acc#{Name => Value};
-                                    error ->
-                                        Acc
-                                end;
-                           (#field{name = Name,
-                                   offset = FieldOffset,
-                                   size = FieldSize} = F,
-                            Acc) ->
-                                %% Low-frequency fields are in record
-                                <<_:FieldOffset/binary,
-                                  FieldBin:FieldSize/binary,
-                                  _/binary>> = RecordBin,
-                                {Decoded, _} =
-                                    decode_field_value(F, FieldBin, State),
-                                Acc#{Name => Decoded}
-                        end, #{}, Fields),
-                    {ok, Result};
+                    try
+                        Result = lists:foldl(
+                            fun(#field{name = Name, frequency = high} = F,
+                                Acc) ->
+                                    %% High-frequency fields might be in
+                                    %% WAL/ETS, check there first
+                                    case read_field(SlotIdx, F, State) of
+                                        {ok, Value} ->
+                                            Acc#{Name => Value};
+                                        error ->
+                                            %% Field not found in WAL/file,
+                                            %% treat as undefined
+                                            Acc#{Name => undefined}
+                                    end;
+                               (#field{name = Name,
+                                       offset = FieldOffset,
+                                       size = FieldSize} = F,
+                                Acc) ->
+                                    %% Low-frequency fields are in record
+                                    <<_:FieldOffset/binary,
+                                      FieldBin:FieldSize/binary,
+                                      _/binary>> = RecordBin,
+                                    {Decoded, _} =
+                                        decode_field_value(F, FieldBin, State),
+                                    Acc#{Name => Decoded}
+                            end, #{}, Fields),
+                        {ok, Result}
+                    catch
+                        _:_ ->
+                            %% Decoding error (e.g., missing atom in atom table)
+                            %% indicates corrupted or partially written data
+                            error
+                    end;
                 {error, _} ->
                     error
             end;
