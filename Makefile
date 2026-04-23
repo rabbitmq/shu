@@ -10,4 +10,15 @@ endef
 LOCAL_DEPS = sasl crypto
 
 DIALYZER_OPTS += --src -r test
+
+.PHONY: bench
+bench:
+	rebar3 compile
+	erl -pa _build/default/lib/shu/ebin -noshell -eval 'shu_bench:run()' -run init stop
+
+.PHONY: bench-large
+bench-large:
+	rebar3 compile
+	erl -pa _build/default/lib/shu/ebin -noshell -eval 'shu_bench:run(100000)' -run init stop
+
 include $(if $(ERLANG_MK_FILENAME),$(ERLANG_MK_FILENAME),erlang.mk)
