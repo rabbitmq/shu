@@ -22,6 +22,7 @@
          do_compact/1,
          finish_compact/2,
          info/1,
+         fold/3,
          migrate/2]).
 
 -ifdef(TEST).
@@ -1128,6 +1129,16 @@ info(#shu{cfg = Cfg, slot_count = SC, atom_count = AC,
       wal_capacity => WalCap,
       wal_usage => WC / WalCap,
       compacting => Comp}.
+
+%%% ============================================================
+%%% Fold
+%%% ============================================================
+
+-spec fold(fun((Key :: binary(), Acc) -> Acc), Acc, state()) -> Acc.
+fold(Fun, Acc0, #shu{key_to_slot = KeyToSlot}) ->
+    maps:fold(fun(Key, _SlotIdx, Acc) ->
+              Fun(Key, Acc)
+      end, Acc0, KeyToSlot).
 
 -spec migrate(state(), schema()) ->
     {ok, state()} | {error, term()}.

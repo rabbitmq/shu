@@ -163,6 +163,24 @@ casts) while compaction runs in the background.
   compacting := false} = shu:info(State).
 ```
 
+### Fold
+
+Iterate over all live keys in the store without exposing the internal state:
+
+```erlang
+%% Count all keys
+Count = shu:fold(fun(Key, Acc) ->
+                   Acc + 1
+           end, 0, State),
+
+%% Collect all keys
+Keys = shu:fold(fun(Key, Acc) ->
+                  [Key | Acc]
+           end, [], State),
+```
+
+The fold function threads an accumulator through all live keys. Keys are returned in arbitrary order. The internal `#shu{}` state structure is not exposed to the caller.
+
 ## Ra Integration Pattern
 
 The primary use case for shu is replacing DETS in `ra_log_meta`. The
