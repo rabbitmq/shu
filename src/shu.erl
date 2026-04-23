@@ -539,7 +539,12 @@ open_existing(Filename, #cfg{schema_crc = ExpectedCrc} = Cfg0) ->
             Err
     end.
 
--spec close(state()) -> ok.
+-spec close(state()) -> ok | {error, term()}.
+close(#shu{compacting = true} = _State) ->
+    %% Cannot close while compaction is in progress. The file layout is
+    %% inconsistent and potentially being written to by do_compact/1.
+    %% Complete the compaction (finish_compact) before closing.
+    {error, compaction_in_progress};
 close(State0) ->
     #shu{fd = Fd, wal_tab = Tab, cfg = Cfg,
          atom_count = AtomCount} = flush_pending_wal(State0),
