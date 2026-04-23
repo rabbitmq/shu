@@ -1007,23 +1007,13 @@ delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
 %%% ============================================================
 
 -spec sync(state()) -> {ok, state()} | {error, term()}.
-sync(State) ->
-    sync_internal(State).
-
-sync_internal(#shu{fd = Fd, compacting = true} = State) ->
-    %% During compaction: accumulated writes in pending_wal buffer need to be
-    %% flushed to disk before syncing. This is necessary because:
-    %% - During normal operation, WAL entries go directly to disk (see line 870)
-    %% - During compaction, WAL entries accumulate in pending_wal to avoid
-    %%   blocking on wal_full (see line 840, 868)
-    %% - sync() must write these buffered entries before calling file:sync()
-    State1 = flush_pending_wal(State),
-    case file:sync(Fd) of
-        ok -> {ok, State1};
-        {error, _} = Err -> Err
-    end;
-sync_internal(#shu{fd = Fd} = State) ->
-    %% During normal operation: all writes go directly to disk, so pending_wal
+sync(#shu{compacting = true} = _State) ->
+    %% Cannot sync during compaction because the WAL region is being
+    %% reorganized and file layout is inconsistent. Pending writes are
+    %% buffered and will be flushed when compaction completes.
+    {error, compaction_in_progress};
+sync(#shu{fd = Fd} = State) ->
+    %% Normal operation: all writes go directly to disk, so pending_wal
     %% is always empty. Just sync the file descriptor.
     case file:sync(Fd) of
         ok -> {ok, State};
