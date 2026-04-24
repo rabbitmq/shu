@@ -22,6 +22,7 @@ all() ->
      {group, wal},
      {group, compaction},
      {group, batch},
+     {group, fold},
      {group, ra_integration},
      {group, error_paths},
      {group, recovery},
@@ -72,6 +73,12 @@ groups() ->
       [write_batch_multiple_keys,
        write_batch_single_fsync,
        write_batch_wal_full_continues]},
+     {fold, [],
+      [fold_low_freq_fields,
+       fold_high_freq_fields,
+       fold_mixed_fields,
+       fold_collects_all_records,
+       fold_with_readahead]},
      {ra_integration, [],
       [ra_meta_atomic_term_and_vote,
        ra_meta_variable_uid_keys,
@@ -570,6 +577,106 @@ write_batch_wal_full_continues(Config) ->
             ?assert(maps:get(slot_count, shu:info(S1)) > 0),
             ok = shu:close(S1)
     end.
+
+%%% ============================================================
+%%% Fold tests
+%%% ============================================================
+
+fold_low_freq_fields(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S1} = shu:write(S0, K1, [{current_term, 5}, {voted_for, {ra, 'ra@node1'}}]),
+    {ok, S2} = shu:write(S1, K2, [{current_term, 10}, {voted_for, {node2, 'n2@host'}}]),
+    {ok, S3} = shu:sync(S2),
+    %% Verify keys are stored
+    ?assertEqual(2, maps:size(S3#shu.key_to_slot)),
+    %% Fold should collect all records with their fields
+    Records = shu:fold(fun(Key, Fields, Acc) ->
+        [#{key => Key, fields => Fields} | Acc]
+    end, [], S3),
+    ?assertEqual(2, length(Records)),
+    ok = shu:close(S3).
+
+fold_high_freq_fields(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    %% Write high-freq field that stays in WAL
+    {ok, S1} = shu:write(S0, Key, last_applied, 42),
+    {ok, S2} = shu:sync(S1),
+    %% Fold should include the high-freq field from WAL
+    Records = shu:fold(fun(K, Fields, Acc) ->
+        case maps:get(last_applied, Fields, error) of
+            42 ->
+                [K | Acc];
+            _ ->
+                Acc
+        end
+    end, [], S2),
+    ?assertEqual(1, length(Records)),
+    ok = shu:close(S2).
+
+fold_mixed_fields(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    Key = make_key(1),
+    %% Write both low-freq and high-freq fields
+    {ok, S1} = shu:write(S0, Key, [{current_term, 3},
+                                     {voted_for, {ra, 'ra@node1'}},
+                                     {last_applied, 99}]),
+    {ok, S2} = shu:sync(S1),
+    %% Fold should return record with all fields
+    Result = shu:fold(fun(_K, Fields, Acc) ->
+        case {maps:get(current_term, Fields),
+              maps:get(voted_for, Fields),
+              maps:get(last_applied, Fields)} of
+            {3, {ra, 'ra@node1'}, 99} ->
+                [complete];
+            _ ->
+                Acc
+        end
+    end, [], S2),
+    ?assertEqual([complete], Result),
+    ok = shu:close(S2).
+
+fold_collects_all_records(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    %% Write 10 records
+    S1 = lists:foldl(
+        fun(N, S) ->
+            Key = make_key(N),
+            {ok, S_} = shu:write(S, Key, current_term, N * 10),
+            S_
+        end, S0, lists:seq(1, 10)),
+    {ok, S2} = shu:sync(S1),
+    %% Fold should collect all
+    Count = shu:fold(fun(_K, _Fields, Acc) ->
+        Acc + 1
+    end, 0, S2),
+    ?assertEqual(10, Count),
+    ok = shu:close(S2).
+
+fold_with_readahead(Config) ->
+    File = ?config(shu_file, Config),
+    {ok, S0} = shu:open(File, ra_meta_schema()),
+    %% Write 5 records
+    S1 = lists:foldl(
+        fun(N, S) ->
+            Key = make_key(N),
+            {ok, S_} = shu:write(S, Key, [{current_term, N},
+                                          {last_applied, N * 100}]),
+            S_
+        end, S0, lists:seq(1, 5)),
+    {ok, S2} = shu:sync(S1),
+    %% Fold with explicit readahead should work
+    Records = shu:fold(fun(_K, _Fields, Acc) ->
+        Acc + 1
+    end, 0, S2, 4096),
+    ?assertEqual(5, Records),
+    ok = shu:close(S2).
 
 %%% ============================================================
 %%% Ra integration tests

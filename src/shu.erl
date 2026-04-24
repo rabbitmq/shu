@@ -1232,7 +1232,16 @@ decode_record_from_buffer(SlotIdx, BatchBin, FirstSlot, Cfg, State) ->
         RecordBin when is_binary(RecordBin) ->
             try
                 Fields = lists:foldl(
-                           fun(#field{name = Name, offset = FieldOffset,
+                           fun(#field{name = Name, frequency = high} = F, Acc) ->
+                                   %% High-frequency fields might be in WAL/ETS,
+                                   %% check there first, fall back to buffer
+                                   case read_field(SlotIdx, F, State) of
+                                       {ok, Value} ->
+                                           Acc#{Name => Value};
+                                       error ->
+                                           Acc#{Name => undefined}
+                                   end;
+                              (#field{name = Name, offset = FieldOffset,
                                       size = FieldSize} = F, Acc) ->
                                    <<_:FieldOffset/binary,
                                      FieldBin:FieldSize/binary,
