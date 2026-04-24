@@ -23,6 +23,7 @@
          finish_compact/2,
          info/1,
          fold/3,
+         fold/4,
          migrate/2]).
 
 -ifdef(TEST).
@@ -1154,11 +1155,103 @@ info(#shu{cfg = Cfg, slot_count = SC, atom_count = AC,
 %%% Fold
 %%% ============================================================
 
--spec fold(fun((Key :: binary(), Acc) -> Acc), Acc, state()) -> Acc.
-fold(Fun, Acc0, #shu{key_to_slot = KeyToSlot}) ->
-    maps:fold(fun(Key, _SlotIdx, Acc) ->
-              Fun(Key, Acc)
-      end, Acc0, KeyToSlot).
+-spec fold(fun((Key :: binary(), Fields :: #{atom() => term()}, Acc) -> Acc),
+           Acc, state()) ->
+    Acc.
+fold(Fun, Acc0, State) ->
+    fold(Fun, Acc0, State, 65536).
+
+-spec fold(fun((Key :: binary(), Fields :: #{atom() => term()}, Acc) -> Acc),
+           Acc, state(), pos_integer()) ->
+    Acc.
+fold(Fun, Acc0, State, ReadaheadBytes) ->
+    #shu{key_to_slot = KeyToSlot, cfg = Cfg, fd = Fd} = State,
+    %% Create sorted list of {SlotIdx, Key} for sequential access
+    KeySlotList = lists:sort([{S, K} || {K, S} <- maps:to_list(KeyToSlot)]),
+    fold_loop(Fun, Acc0, State, KeySlotList, Cfg, Fd, ReadaheadBytes, 0).
+
+fold_loop(_Fun, Acc, _State, [], _Cfg, _Fd, _ReadaheadBytes, _BufferStart) ->
+    Acc;
+fold_loop(Fun, Acc, State, KeySlotList, Cfg, Fd, ReadaheadBytes, _BufferStart) ->
+    %% Determine which records to read in this batch
+    {BatchSlots, RestKeys} = gather_batch(KeySlotList, Cfg, ReadaheadBytes, []),
+    case BatchSlots of
+        [] ->
+            Acc;
+        _ ->
+            %% Calculate byte range for this batch
+            {FirstSlot, _} = hd(BatchSlots),
+            {LastSlot, _} = lists:last(BatchSlots),
+            #cfg{record_offset = RecordOffset, record_size = RecordSize} = Cfg,
+            StartPos = RecordOffset + FirstSlot * RecordSize,
+            EndPos = RecordOffset + (LastSlot + 1) * RecordSize,
+            BatchSize = EndPos - StartPos,
+            %% Read batch into memory
+            case file:pread(Fd, StartPos, BatchSize) of
+                {ok, BatchBin} ->
+                    %% Process each record in the batch with decoded fields
+                    Acc1 = lists:foldl(
+                             fun({SlotIdx, Key}, AccIn) ->
+                                     case decode_record_from_buffer(SlotIdx,
+                                                                    BatchBin,
+                                                                    FirstSlot,
+                                                                    Cfg,
+                                                                    State) of
+                                         {ok, Fields} ->
+                                             Fun(Key, Fields, AccIn);
+                                         error ->
+                                             AccIn
+                                     end
+                             end, Acc, BatchSlots),
+                    fold_loop(Fun, Acc1, State, RestKeys, Cfg, Fd,
+                             ReadaheadBytes, FirstSlot);
+                {error, _} ->
+                    %% On read error, skip this batch
+                    fold_loop(Fun, Acc, State, RestKeys, Cfg, Fd,
+                             ReadaheadBytes, FirstSlot)
+            end
+    end.
+
+%% Gather keys up to ReadaheadBytes worth of records
+gather_batch([], _Cfg, _ReadaheadBytes, Acc) ->
+    {lists:reverse(Acc), []};
+gather_batch(KeySlotList, #cfg{record_size = RecordSize} = Cfg, ReadaheadBytes, Acc) ->
+    TotalBytes = length(Acc) * RecordSize,
+    case TotalBytes >= ReadaheadBytes of
+        true ->
+            {lists:reverse(Acc), KeySlotList};
+        false ->
+            case KeySlotList of
+                [H | T] ->
+                    gather_batch(T, Cfg, ReadaheadBytes, [H | Acc]);
+                [] ->
+                    {lists:reverse(Acc), []}
+            end
+    end.
+
+%% Decode record from readahead buffer into field map
+decode_record_from_buffer(SlotIdx, BatchBin, FirstSlot, Cfg, State) ->
+    Offset = (SlotIdx - FirstSlot) * Cfg#cfg.record_size,
+    case catch binary:part(BatchBin, Offset, Cfg#cfg.record_size) of
+        RecordBin when is_binary(RecordBin) ->
+            try
+                Fields = lists:foldl(
+                           fun(#field{name = Name, offset = FieldOffset,
+                                      size = FieldSize} = F, Acc) ->
+                                   <<_:FieldOffset/binary,
+                                     FieldBin:FieldSize/binary,
+                                     _/binary>> = RecordBin,
+                                   {Decoded, _} = decode_field_value(F, FieldBin, State),
+                                   Acc#{Name => Decoded}
+                           end, #{}, Cfg#cfg.fields),
+                {ok, Fields}
+            catch
+                _:_ ->
+                    error
+            end;
+        _ ->
+            error
+    end.
 
 -spec migrate(state(), schema()) ->
     {ok, state()} | {error, term()}.

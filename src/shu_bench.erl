@@ -131,6 +131,21 @@ run(N) ->
     print_result("Shu Mixed", ShuMixedTime, N),
     print_result("DETS Mixed", DetsMixedTime, N),
 
+    %% 6. Benchmark Fold (Sequential Traversal)
+    io:format("~n--- Fold (Sequential Traversal, ~p records) ---~n", [N]),
+    {ShuFoldTime, ShuFoldCount} = timer:tc(fun() ->
+        shu:fold(fun(_Key, _Fields, Acc) -> Acc + 1 end, 0, Shu6, 65536)
+    end),
+
+    {DetsFoldTime, DetsFoldCount} = timer:tc(fun() ->
+        dets:foldl(fun({_Key, _, _, _}, Acc) -> Acc + 1 end, 0, Dets)
+    end),
+
+    print_result("Shu Fold", ShuFoldTime, N),
+    print_result("DETS Fold", DetsFoldTime, N),
+    io:format("  Shu fold visited ~p records~n", [ShuFoldCount]),
+    io:format("  DETS fold visited ~p records~n", [DetsFoldCount]),
+
     %% Teardown
     ok = shu:close(Shu6),
     ok = dets:close(Dets),
