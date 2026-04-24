@@ -71,7 +71,6 @@
               idx_to_atom = #{} :: #{non_neg_integer() => atom()},
               atom_count = 0 :: non_neg_integer(),
               wal_byte_pos = 0 :: non_neg_integer(),
-              wal_count = 0 :: non_neg_integer(),
               wal_tab :: ets:tid(),
               compacting = false :: boolean(),
               pending_wal = [] :: [iodata()]}).

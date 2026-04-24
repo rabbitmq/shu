@@ -581,10 +581,7 @@ recover_wal(Fd, #cfg{wal_size = WalSize,
     if WalSize > 0 ->
             case file:pread(Fd, WalOff, WalSize) of
                 {ok, Bin} ->
-                    State1 = scan_wal(Bin, 0, WalSize, 0, State0),
-                    %% wal_count must reflect actual unique ETS entries
-                    WalCount = ets:info(State1#shu.wal_tab, size),
-                    State1#shu{wal_count = WalCount};
+                    scan_wal(Bin, 0, WalSize, 0, State0);
                 eof ->
                     %% File was truncated (e.g., after successful compaction).
                     %% WAL region does not exist; no entries to recover.
@@ -820,7 +817,7 @@ do_write_fields(Cfg, SlotIdx, FieldValues, State) ->
 prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                         Encoded,
                         #shu{cfg = Cfg, fd = _Fd,
-                             wal_count = WalCount, wal_tab = Tab,
+                             wal_tab = Tab,
                              wal_byte_pos = WalBytePos,
                              compacting = Compacting,
                              pending_wal = Pending} = State) ->
@@ -839,19 +836,12 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
             Crc = erlang:crc32(CrcData),
             Entry = <<CrcData/binary, Crc:32/unsigned-big>>,
             EtsKey = {SlotIdx, FieldId},
-            IsNew = not ets:member(Tab, EtsKey),
             true = ets:insert(Tab, {EtsKey, Encoded}),
-            NewWalCount = case IsNew of
-                              true -> WalCount + 1;
-                              false -> WalCount
-                          end,
             case Compacting of
                 true ->
-                    {ok, State#shu{wal_count = NewWalCount,
-                                   pending_wal = [Entry | Pending]}, undefined};
+                    {ok, State#shu{pending_wal = [Entry | Pending]}, undefined};
                 false ->
-                    {ok, State#shu{wal_count = NewWalCount,
-                                   wal_byte_pos = WalBytePos + EntrySize}, Entry}
+                    {ok, State#shu{wal_byte_pos = WalBytePos + EntrySize}, Entry}
             end
     end.
 
@@ -958,26 +948,19 @@ read_field_from_file(SlotIdx, #field{size = Size} = Field,
     {ok, state()} | {error, term()}.
 delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
              free_slots = Free, slot_count = SC,
-             wal_tab = Tab, wal_count = WC} = State, Key) ->
+             wal_tab = Tab} = State, Key) ->
     case K2S of
         #{Key := SlotIdx} ->
             Pos = key_index_pos(Cfg, SlotIdx),
             ok = file:pwrite(Fd, Pos, <<?SLOT_DELETED:8>>),
-            Deleted = lists:foldl(
-                        fun(#field{id = FieldId}, Acc) ->
-                                case ets:member(Tab, {SlotIdx, FieldId}) of
-                                    true ->
-                                        ets:delete(Tab, {SlotIdx, FieldId}),
-                                        Acc + 1;
-                                    false ->
-                                        Acc
-                                end
-                        end, 0, Cfg#cfg.fields),
+            lists:foreach(
+              fun(#field{id = FieldId}) ->
+                      ets:delete(Tab, {SlotIdx, FieldId})
+              end, Cfg#cfg.fields),
             ok = file:sync(Fd),
             {ok, State#shu{key_to_slot = maps:remove(Key, K2S),
                            free_slots = [SlotIdx | Free],
-                           slot_count = SC - 1,
-                           wal_count = WC - Deleted}};
+                           slot_count = SC - 1}};
         _ ->
             {error, not_found}
     end.
@@ -1064,7 +1047,7 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
     true = ets:delete_all_objects(Tab),
     ReversedPending = lists:reverse(Pending),
     State1 = State#shu{wal_byte_pos = 0,
-                        wal_count = 0, compacting = false,
+                        compacting = false,
                         pending_wal = []},
     State2 = replay_pending_wal(ReversedPending, Cfg, Fd, Tab, State1),
     ok = file:sync(Fd),
@@ -1076,14 +1059,12 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
     {State1, IoList} =
         lists:foldl(
           fun(Entry, {S, Acc}) ->
-                  #shu{wal_count = WC, wal_byte_pos = WBP} = S,
+                  #shu{wal_byte_pos = WBP} = S,
                   <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest/binary>> = Entry,
                   <<Value:ValueLen/binary, _Crc:32/unsigned-big>> = Rest,
                   EtsKey = {SlotIdx, FieldId},
-                  IsNew = not ets:member(Tab, EtsKey),
                   true = ets:insert(Tab, {EtsKey, Value}),
-                  S1 = S#shu{wal_count = WC + (case IsNew of true -> 1; false -> 0 end),
-                             wal_byte_pos = WBP + byte_size(Entry)},
+                  S1 = S#shu{wal_byte_pos = WBP + byte_size(Entry)},
                   {S1, [Entry | Acc]}
           end, {State, []}, Pending),
     case IoList of
@@ -1108,8 +1089,9 @@ fit_to_size(Bin, Size) ->
 
 -spec info(state()) -> #{atom() => term()}.
 info(#shu{cfg = Cfg, slot_count = SC, atom_count = AC,
-           wal_count = WC, wal_byte_pos = WBP, compacting = Comp}) ->
+           wal_byte_pos = WBP, compacting = Comp, wal_tab = Tab}) ->
     #cfg{num_slots = NumSlots, wal_size = WalSize} = Cfg,
+    WC = ets:info(Tab, size),
     #{slot_count => SC,
       num_slots => NumSlots,
       atom_count => AC,
