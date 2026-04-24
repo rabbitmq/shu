@@ -1221,12 +1221,8 @@ gather_batch(KeySlotList, #cfg{record_size = RecordSize} = Cfg, ReadaheadBytes, 
         true ->
             {lists:reverse(Acc), KeySlotList};
         false ->
-            case KeySlotList of
-                [H | T] ->
-                    gather_batch(T, Cfg, ReadaheadBytes, [H | Acc]);
-                [] ->
-                    {lists:reverse(Acc), []}
-            end
+            [H | T] = KeySlotList,
+            gather_batch(T, Cfg, ReadaheadBytes, [H | Acc])
     end.
 
 %% Decode record from readahead buffer into field map
