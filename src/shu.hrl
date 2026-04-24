@@ -18,7 +18,7 @@
 
 -define(DEFAULT_EXPECTED_COUNT, 1024).
 -define(DEFAULT_ATOM_TABLE_SLOTS, 256).
--define(WAL_CAPACITY_MULTIPLIER, 4).
+-define(DEFAULT_WAL_SIZE, 16777216). % 16MB default WAL size
 -define(WAL_ZERO_CHUNK, 4096).
 
 -type shu_type() :: {integer, 64}
@@ -34,7 +34,8 @@
 
 -type schema() :: #{fields := [field_spec()],
                     key := {binary, pos_integer()},
-                    expected_count => pos_integer()}.
+                    expected_count => pos_integer(),
+              wal_size => pos_integer()}.
 
 -record(field, {name :: atom(),
                 id :: non_neg_integer(),
@@ -54,8 +55,7 @@
               low_freq_fields :: [#field{}],
               atom_slot_size :: pos_integer(),
               atom_table_slots :: pos_integer(),
-              max_wal_entry_size :: pos_integer(),
-              wal_capacity :: pos_integer(),
+              wal_size :: pos_integer(),
               atom_table_offset :: pos_integer(),
               key_index_offset :: pos_integer(),
               record_offset :: pos_integer(),
@@ -70,9 +70,7 @@
               atom_to_idx = #{} :: #{atom() => non_neg_integer()},
               idx_to_atom = #{} :: #{non_neg_integer() => atom()},
               atom_count = 0 :: non_neg_integer(),
-              wal_pos = 0 :: non_neg_integer(),
               wal_byte_pos = 0 :: non_neg_integer(),
-              wal_seq = 0 :: non_neg_integer(),
               wal_count = 0 :: non_neg_integer(),
               wal_tab :: ets:tid(),
               compacting = false :: boolean(),

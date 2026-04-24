@@ -62,8 +62,7 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
                      [{F#field.name, F} || F <- FieldRecs]),
         AtomSlotSize = compute_atom_slot_size(Fields),
         AtomTableSlots = ?DEFAULT_ATOM_TABLE_SLOTS,
-        MaxWalEntrySize = compute_max_wal_entry_size(HighFreq),
-        WalCapacity = ExpectedCount * ?WAL_CAPACITY_MULTIPLIER,
+        WalSize = maps:get(wal_size, Schema, ?DEFAULT_WAL_SIZE),
         SchemaCrc = compute_schema_crc(Fields, MaxKeySize),
         AtomTableOffset = ?HEADER_SIZE,
         KeyIndexOffset = AtomTableOffset + AtomTableSlots * AtomSlotSize,
@@ -81,8 +80,7 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
                    low_freq_fields = LowFreq,
                    atom_slot_size = AtomSlotSize,
                    atom_table_slots = AtomTableSlots,
-                   max_wal_entry_size = MaxWalEntrySize,
-                   wal_capacity = WalCapacity,
+                   wal_size = WalSize,
                    atom_table_offset = AtomTableOffset,
                    key_index_offset = KeyIndexOffset,
                    record_offset = RecordOffset,
@@ -140,13 +138,6 @@ max_atom_bytes({atom, MaxBytes}) -> MaxBytes;
 max_atom_bytes({tuple, Types}) ->
     lists:max([0 | [max_atom_bytes(T) || T <- Types]]);
 max_atom_bytes(_) -> 0.
-
--spec compute_max_wal_entry_size([#field{}]) -> pos_integer().
-compute_max_wal_entry_size([]) ->
-    4 + 1 + 2 + 0 + 8 + 4;
-compute_max_wal_entry_size(HighFreqFields) ->
-    MaxFieldSize = lists:max([S || #field{size = S} <- HighFreqFields]),
-    4 + 1 + 2 + MaxFieldSize + 8 + 4.
 
 -spec compute_schema_crc([field_spec()], pos_integer()) -> non_neg_integer().
 compute_schema_crc(Fields, KeySize) ->
@@ -399,7 +390,7 @@ write_header(Fd, #cfg{schema_crc = Crc,
                        max_key_size = MaxKeySize,
                        record_size = RecordSize,
                        num_slots = NumSlots,
-                       wal_capacity = WalCap,
+                       wal_size = WalSize,
                        atom_slot_size = AtomSlotSize,
                        atom_table_slots = AtomTableSlots},
              AtomCount) ->
@@ -409,7 +400,7 @@ write_header(Fd, #cfg{schema_crc = Crc,
                MaxKeySize:16/unsigned-big,
                RecordSize:32/unsigned-big,
                NumSlots:32/unsigned-big,
-               WalCap:32/unsigned-big,
+               WalSize:32/unsigned-big,
                AtomSlotSize:16/unsigned-big,
                AtomCount:16/unsigned-big,
                AtomTableSlots:16/unsigned-big,
@@ -424,7 +415,7 @@ read_header(Fd) ->
                MaxKeySize:16/unsigned-big,
                RecordSize:32/unsigned-big,
                NumSlots:32/unsigned-big,
-               WalCap:32/unsigned-big,
+               WalSize:32/unsigned-big,
                AtomSlotSize:16/unsigned-big,
                AtomCount:16/unsigned-big,
                AtomTableSlots:16/unsigned-big,
@@ -434,7 +425,7 @@ read_header(Fd) ->
                    max_key_size => MaxKeySize,
                    record_size => RecordSize,
                    num_slots => NumSlots,
-                   wal_capacity => WalCap,
+                   wal_size => WalSize,
                    atom_slot_size => AtomSlotSize,
                    atom_count => AtomCount,
                    atom_table_slots => AtomTableSlots}};
@@ -469,15 +460,13 @@ open(Filename, Schema) ->
 create_new(Filename, #cfg{num_slots = NumSlots,
                            max_key_size = MaxKeySize,
                            record_size = RecordSize,
-                           wal_capacity = WalCap,
-                           max_wal_entry_size = MaxWalEntrySize,
+                           wal_size = WalSize,
                            atom_table_slots = AtomTableSlots,
                            atom_slot_size = AtomSlotSize} = Cfg) ->
     {ok, Fd} = file:open(Filename, [read, write, raw, binary]),
     ok = write_header(Fd, Cfg, 0),
     KeyIndexSize = NumSlots * (1 + 1 + MaxKeySize),
     RecordAreaSize = NumSlots * RecordSize,
-    WalSize = WalCap * MaxWalEntrySize,
     TotalSize = ?HEADER_SIZE +
                 AtomTableSlots * AtomSlotSize +
                 KeyIndexSize + RecordAreaSize + WalSize,
@@ -499,7 +488,7 @@ open_existing(Filename, #cfg{schema_crc = ExpectedCrc} = Cfg0) ->
                atom_slot_size := AtomSlotSize,
                atom_count := AtomCount,
                atom_table_slots := AtomTableSlots,
-               wal_capacity := WalCap}} ->
+               wal_size := WalSize}} ->
             AtomTableOffset = ?HEADER_SIZE,
             KeyIndexOffset = AtomTableOffset + AtomTableSlots * AtomSlotSize,
             RecordOffset = KeyIndexOffset +
@@ -508,7 +497,7 @@ open_existing(Filename, #cfg{schema_crc = ExpectedCrc} = Cfg0) ->
             Cfg = Cfg0#cfg{num_slots = NumSlots,
                            atom_slot_size = AtomSlotSize,
                            atom_table_slots = AtomTableSlots,
-                           wal_capacity = WalCap,
+                           wal_size = WalSize,
                            atom_table_offset = AtomTableOffset,
                            key_index_offset = KeyIndexOffset,
                            record_offset = RecordOffset,
@@ -586,14 +575,13 @@ scan_key_index(Bin, MaxKeySize, Idx, NumSlots,
                            State#shu{free_slots = [Idx | Free]})
     end.
 
-recover_wal(Fd, #cfg{wal_capacity = WalCap, max_wal_entry_size = MaxEntrySize,
+recover_wal(Fd, #cfg{wal_size = WalSize,
                       wal_offset = WalOff},
             State0) ->
-    TotalSize = WalCap * MaxEntrySize,
-    if TotalSize > 0 ->
-            case file:pread(Fd, WalOff, TotalSize) of
+    if WalSize > 0 ->
+            case file:pread(Fd, WalOff, WalSize) of
                 {ok, Bin} ->
-                    State1 = scan_wal(Bin, 0, WalCap, 0, State0),
+                    State1 = scan_wal(Bin, 0, WalSize, 0, State0),
                     %% wal_count must reflect actual unique ETS entries
                     WalCount = ets:info(State1#shu.wal_tab, size),
                     State1#shu{wal_count = WalCount};
@@ -610,26 +598,26 @@ recover_wal(Fd, #cfg{wal_capacity = WalCap, max_wal_entry_size = MaxEntrySize,
     end.
 
 
-scan_wal(<<>>, _Idx, _WalCap, _BytePos, State) ->
+scan_wal(<<>>, _Idx, _WalSize, _BytePos, State) ->
     State;
-scan_wal(Bin, Idx, WalCap, BytePos, State) when Idx < WalCap ->
+scan_wal(Bin, Idx, WalSize, BytePos, State) when BytePos < WalSize ->
     case Bin of
         <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest1/binary>> ->
             case Rest1 of
-                <<Value:ValueLen/binary, Seq:64/unsigned-big, StoredCrc:32/unsigned-big, Rest2/binary>> ->
-                    %% Verify CRC: recompute over slot_idx, field_id, value_len, value, and seq
+                <<Value:ValueLen/binary, StoredCrc:32/unsigned-big, Rest2/binary>> ->
+                    %% Verify CRC: recompute over slot_idx, field_id, value_len, and value
                     CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
-                                Value/binary, Seq:64/unsigned-big>>,
+                                Value/binary>>,
                     ComputedCrc = erlang:crc32(CrcData),
                     if
-                        Seq =:= 0 ->
-                            %% Empty entry
+                        SlotIdx =:= 0 andalso FieldId =:= 0 andalso ValueLen =:= 0 ->
+                            %% Empty entry (pre-allocated zeros)
                             State;
                         ComputedCrc =:= StoredCrc ->
                             %% Valid entry
-                            EntrySize = 4 + 1 + 2 + ValueLen + 8 + 4,
-                            State1 = process_recovered_wal_entry(SlotIdx, FieldId, Value, Seq, BytePos + EntrySize, Idx, State),
-                            scan_wal(Rest2, Idx + 1, WalCap, BytePos + EntrySize, State1);
+                            EntrySize = 4 + 1 + 2 + ValueLen + 4,
+                            State1 = process_recovered_wal_entry(SlotIdx, FieldId, Value, BytePos + EntrySize, State),
+                            scan_wal(Rest2, Idx + 1, WalSize, BytePos + EntrySize, State1);
                         true ->
                             %% CRC mismatch; torn write detected. Skip this entry.
                             State
@@ -642,13 +630,11 @@ scan_wal(Bin, Idx, WalCap, BytePos, State) when Idx < WalCap ->
             %% Incomplete header
             State
     end;
-scan_wal(_, _Idx, _WalCap, _BytePos, State) ->
+scan_wal(_, _Idx, _WalSize, _BytePos, State) ->
     State.
 
-process_recovered_wal_entry(SlotIdx, FieldId, Value, Seq, NextBytePos, Idx, State) ->
-    State1 = State#shu{wal_seq = max(State#shu.wal_seq, Seq),
-                       wal_pos = max(State#shu.wal_pos, Idx + 1),
-                       wal_byte_pos = max(State#shu.wal_byte_pos, NextBytePos)},
+process_recovered_wal_entry(SlotIdx, FieldId, Value, NextBytePos, State) ->
+    State1 = State#shu{wal_byte_pos = max(State#shu.wal_byte_pos, NextBytePos)},
     case lists:member(SlotIdx, State1#shu.free_slots) of
         true ->
             %% Slot is free, skip orphaned WAL entry
@@ -656,20 +642,8 @@ process_recovered_wal_entry(SlotIdx, FieldId, Value, Seq, NextBytePos, Idx, Stat
         false ->
             #shu{wal_tab = Tab} = State1,
             Key = {SlotIdx, FieldId},
-            ShouldInsert =
-                case ets:lookup(Tab, Key) of
-                    [{_, _, ExistingSeq}] when ExistingSeq >= Seq ->
-                        false;
-                    _ ->
-                        true
-                end,
-            case ShouldInsert of
-                true ->
-                    true = ets:insert(Tab, {Key, Value, Seq}),
-                    State1;
-                false ->
-                    State1
-            end
+            true = ets:insert(Tab, {Key, Value}),
+            State1
     end.
 
 %%% ============================================================
@@ -846,41 +820,37 @@ do_write_fields(Cfg, SlotIdx, FieldValues, State) ->
 prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                         Encoded,
                         #shu{cfg = Cfg, fd = _Fd,
-                             wal_pos = WalPos, wal_seq = WalSeq,
                              wal_count = WalCount, wal_tab = Tab,
                              wal_byte_pos = WalBytePos,
                              compacting = Compacting,
                              pending_wal = Pending} = State) ->
-    #cfg{wal_capacity = WalCap} = Cfg,
-    case WalPos >= WalCap andalso not Compacting of
+    #cfg{wal_size = WalSize} = Cfg,
+    %% Calculate entry size first to check if it fits
+    ValueLen = byte_size(Encoded),
+    EntrySize = 4 + 1 + 2 + ValueLen + 4,
+    case WalBytePos + EntrySize > WalSize andalso not Compacting of
         true ->
             {wal_full, State};
         false ->
-            Seq = WalSeq + 1,
-            %% Entry format: slot_idx:u32 | field_id:u8 | value_len:u16 | value:N | seq:u64 | crc:u32
-            %% CRC is computed over slot_idx, field_id, value_len, value, and seq.
-            ValueLen = byte_size(Encoded),
+            %% Entry format: slot_idx:u32 | field_id:u8 | value_len:u16 | value:N | crc:u32
+            %% CRC is computed over slot_idx, field_id, value_len, and value.
             CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
-                        Encoded/binary, Seq:64/unsigned-big>>,
+                        Encoded/binary>>,
             Crc = erlang:crc32(CrcData),
             Entry = <<CrcData/binary, Crc:32/unsigned-big>>,
-            EntrySize = byte_size(Entry),
             EtsKey = {SlotIdx, FieldId},
             IsNew = not ets:member(Tab, EtsKey),
-            true = ets:insert(Tab, {EtsKey, Encoded, Seq}),
+            true = ets:insert(Tab, {EtsKey, Encoded}),
             NewWalCount = case IsNew of
                               true -> WalCount + 1;
                               false -> WalCount
                           end,
             case Compacting of
                 true ->
-                    {ok, State#shu{wal_seq = Seq,
-                                   wal_count = NewWalCount,
+                    {ok, State#shu{wal_count = NewWalCount,
                                    pending_wal = [Entry | Pending]}, undefined};
                 false ->
-                    {ok, State#shu{wal_pos = WalPos + 1,
-                                   wal_seq = Seq,
-                                   wal_count = NewWalCount,
+                    {ok, State#shu{wal_count = NewWalCount,
                                    wal_byte_pos = WalBytePos + EntrySize}, Entry}
             end
     end.
@@ -960,7 +930,7 @@ read_all(#shu{key_to_slot = K2S,
 read_field(SlotIdx, #field{frequency = high, id = FieldId} = Field,
            #shu{wal_tab = Tab} = State) ->
     case ets:lookup(Tab, {SlotIdx, FieldId}) of
-        [{_, ValueBin, _Seq}] ->
+        [{_, ValueBin}] ->
             {Decoded, _} = decode_field_value(Field, ValueBin, State),
             {ok, Decoded};
         [] ->
@@ -1056,7 +1026,7 @@ do_compact(#{filename := Filename, cfg := Cfg,
                      [{FieldId, Field} ||
                       #field{id = FieldId} = Field <- Cfg#cfg.fields]),
         PWrites = lists:filtermap(
-                    fun({{SlotIdx, FieldId}, ValueBin, _Seq}) ->
+                    fun({{SlotIdx, FieldId}, ValueBin}) ->
                             case maps:find(FieldId, FieldMap) of
                                 {ok, #field{size = Size} = Field} ->
                                     Pos = field_pos(Cfg, SlotIdx, Field),
@@ -1093,7 +1063,7 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
     ok = file:sync(Fd),
     true = ets:delete_all_objects(Tab),
     ReversedPending = lists:reverse(Pending),
-    State1 = State#shu{wal_pos = 0, wal_byte_pos = 0, wal_seq = 0,
+    State1 = State#shu{wal_byte_pos = 0,
                         wal_count = 0, compacting = false,
                         pending_wal = []},
     State2 = replay_pending_wal(ReversedPending, Cfg, Fd, Tab, State1),
@@ -1106,15 +1076,13 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
     {State1, IoList} =
         lists:foldl(
           fun(Entry, {S, Acc}) ->
-                  #shu{wal_pos = WalPos, wal_count = WC, wal_byte_pos = WBP} = S,
+                  #shu{wal_count = WC, wal_byte_pos = WBP} = S,
                   <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest/binary>> = Entry,
-                  <<Value:ValueLen/binary, Seq:64/unsigned-big, _Crc:32/unsigned-big>> = Rest,
+                  <<Value:ValueLen/binary, _Crc:32/unsigned-big>> = Rest,
                   EtsKey = {SlotIdx, FieldId},
                   IsNew = not ets:member(Tab, EtsKey),
-                  true = ets:insert(Tab, {EtsKey, Value, Seq}),
-                  S1 = S#shu{wal_pos = WalPos + 1,
-                             wal_seq = Seq,
-                             wal_count = WC + (case IsNew of true -> 1; false -> 0 end),
+                  true = ets:insert(Tab, {EtsKey, Value}),
+                  S1 = S#shu{wal_count = WC + (case IsNew of true -> 1; false -> 0 end),
                              wal_byte_pos = WBP + byte_size(Entry)},
                   {S1, [Entry | Acc]}
           end, {State, []}, Pending),
@@ -1140,15 +1108,15 @@ fit_to_size(Bin, Size) ->
 
 -spec info(state()) -> #{atom() => term()}.
 info(#shu{cfg = Cfg, slot_count = SC, atom_count = AC,
-           wal_count = WC, wal_pos = WP, compacting = Comp}) ->
-    #cfg{num_slots = NumSlots, wal_capacity = WalCap} = Cfg,
+           wal_count = WC, wal_byte_pos = WBP, compacting = Comp}) ->
+    #cfg{num_slots = NumSlots, wal_size = WalSize} = Cfg,
     #{slot_count => SC,
       num_slots => NumSlots,
       atom_count => AC,
       wal_count => WC,
-      wal_pos => WP,
-      wal_capacity => WalCap,
-      wal_usage => WC / WalCap,
+      wal_size => WalSize,
+      wal_byte_pos => WBP,
+      wal_usage => WBP / WalSize,
       compacting => Comp}.
 
 %%% ============================================================
@@ -1358,14 +1326,16 @@ flush_pending_wal(#shu{pending_wal = []} = State) ->
 flush_pending_wal(#shu{pending_wal = Pending, cfg = Cfg, fd = Fd,
                         wal_byte_pos = StartBytePos} = State) ->
     WalOffset = Cfg#cfg.wal_offset,
-    ReversedPending = lists:reverse(Pending),
-    {NewWalPos, NewWalBytePos, IoList} =
+    %% Pending is accumulated in reverse order (newest first).
+    %% By folding over it directly, we calculate the final positions
+    %% and build IoList in the correct (oldest first) order.
+    {NewWalBytePos, IoList} =
         lists:foldl(
-          fun(Entry, {Pos, BytePos, Acc}) ->
-                  {Pos + 1, BytePos + byte_size(Entry), [Entry | Acc]}
-          end, {State#shu.wal_pos, StartBytePos, []}, ReversedPending),
+          fun(Entry, {BytePos, Acc}) ->
+                  {BytePos + byte_size(Entry), [Entry | Acc]}
+          end, {StartBytePos, []}, Pending),
     case IoList of
         [] -> ok;
-        _ -> ok = file:pwrite(Fd, WalOffset + StartBytePos, lists:reverse(IoList))
+        _ -> ok = file:pwrite(Fd, WalOffset + StartBytePos, IoList)
     end,
-    State#shu{pending_wal = [], wal_pos = NewWalPos, wal_byte_pos = NewWalBytePos}.
+    State#shu{pending_wal = [], wal_byte_pos = NewWalBytePos}.

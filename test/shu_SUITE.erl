@@ -11,7 +11,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
--include("shu.hrl").
+-include("../src/shu.hrl").
 
 all() ->
     [{group, encoding},
@@ -591,7 +591,8 @@ fold_low_freq_fields(Config) ->
     {ok, S2} = shu:write(S1, K2, [{current_term, 10}, {voted_for, {node2, 'n2@host'}}]),
     {ok, S3} = shu:sync(S2),
     %% Verify keys are stored
-    ?assertEqual(2, maps:size(S3#shu.key_to_slot)),
+    #{slot_count := SlotCount} = shu:info(S3),
+    ?assertEqual(2, SlotCount),
     %% Fold should collect all records with their fields
     Records = shu:fold(fun(Key, Fields, Acc) ->
         [#{key => Key, fields => Fields} | Acc]
