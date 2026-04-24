@@ -43,7 +43,6 @@
 -compile({inline, [key_index_pos/2,
                    record_pos/2,
                    field_pos/3,
-                   wal_entry_pos/2,
                    lookup_field/2]}).
 
 %%% ============================================================
@@ -63,7 +62,7 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
                      [{F#field.name, F} || F <- FieldRecs]),
         AtomSlotSize = compute_atom_slot_size(Fields),
         AtomTableSlots = ?DEFAULT_ATOM_TABLE_SLOTS,
-        WalEntrySize = compute_wal_entry_size(HighFreq),
+        MaxWalEntrySize = compute_max_wal_entry_size(HighFreq),
         WalCapacity = ExpectedCount * ?WAL_CAPACITY_MULTIPLIER,
         SchemaCrc = compute_schema_crc(Fields, MaxKeySize),
         AtomTableOffset = ?HEADER_SIZE,
@@ -82,7 +81,7 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
                    low_freq_fields = LowFreq,
                    atom_slot_size = AtomSlotSize,
                    atom_table_slots = AtomTableSlots,
-                   wal_entry_size = WalEntrySize,
+                   max_wal_entry_size = MaxWalEntrySize,
                    wal_capacity = WalCapacity,
                    atom_table_offset = AtomTableOffset,
                    key_index_offset = KeyIndexOffset,
@@ -142,12 +141,12 @@ max_atom_bytes({tuple, Types}) ->
     lists:max([0 | [max_atom_bytes(T) || T <- Types]]);
 max_atom_bytes(_) -> 0.
 
--spec compute_wal_entry_size([#field{}]) -> pos_integer().
-compute_wal_entry_size([]) ->
-    4 + 1 + 0 + 8 + 4;
-compute_wal_entry_size(HighFreqFields) ->
+-spec compute_max_wal_entry_size([#field{}]) -> pos_integer().
+compute_max_wal_entry_size([]) ->
+    4 + 1 + 2 + 0 + 8 + 4;
+compute_max_wal_entry_size(HighFreqFields) ->
     MaxFieldSize = lists:max([S || #field{size = S} <- HighFreqFields]),
-    4 + 1 + MaxFieldSize + 8 + 4.
+    4 + 1 + 2 + MaxFieldSize + 8 + 4.
 
 -spec compute_schema_crc([field_spec()], pos_integer()) -> non_neg_integer().
 compute_schema_crc(Fields, KeySize) ->
@@ -386,9 +385,6 @@ record_pos(#cfg{record_offset = Off, record_size = RS}, SlotIdx) ->
 field_pos(Cfg, SlotIdx, #field{offset = FldOff}) ->
     record_pos(Cfg, SlotIdx) + FldOff.
 
-wal_entry_pos(#cfg{wal_offset = Off, wal_entry_size = ES}, WalIdx) ->
-    Off + WalIdx * ES.
-
 lookup_field(Name, #cfg{field_map = FM}) ->
     case FM of
         #{Name := F} -> {ok, F};
@@ -474,14 +470,14 @@ create_new(Filename, #cfg{num_slots = NumSlots,
                            max_key_size = MaxKeySize,
                            record_size = RecordSize,
                            wal_capacity = WalCap,
-                           wal_entry_size = WalEntrySize,
+                           max_wal_entry_size = MaxWalEntrySize,
                            atom_table_slots = AtomTableSlots,
                            atom_slot_size = AtomSlotSize} = Cfg) ->
     {ok, Fd} = file:open(Filename, [read, write, raw, binary]),
     ok = write_header(Fd, Cfg, 0),
     KeyIndexSize = NumSlots * (1 + 1 + MaxKeySize),
     RecordAreaSize = NumSlots * RecordSize,
-    WalSize = WalCap * WalEntrySize,
+    WalSize = WalCap * MaxWalEntrySize,
     TotalSize = ?HEADER_SIZE +
                 AtomTableSlots * AtomSlotSize +
                 KeyIndexSize + RecordAreaSize + WalSize,
@@ -590,14 +586,14 @@ scan_key_index(Bin, MaxKeySize, Idx, NumSlots,
                            State#shu{free_slots = [Idx | Free]})
     end.
 
-recover_wal(Fd, #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize,
+recover_wal(Fd, #cfg{wal_capacity = WalCap, max_wal_entry_size = MaxEntrySize,
                       wal_offset = WalOff},
             State0) ->
-    TotalSize = WalCap * EntrySize,
+    TotalSize = WalCap * MaxEntrySize,
     if TotalSize > 0 ->
             case file:pread(Fd, WalOff, TotalSize) of
                 {ok, Bin} ->
-                    State1 = scan_wal(Bin, EntrySize, 0, WalCap, State0),
+                    State1 = scan_wal(Bin, 0, WalCap, 0, State0),
                     %% wal_count must reflect actual unique ETS entries
                     WalCount = ets:info(State1#shu.wal_tab, size),
                     State1#shu{wal_count = WalCount};
@@ -614,58 +610,67 @@ recover_wal(Fd, #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize,
     end.
 
 
-scan_wal(<<>>, _EntrySize, _Idx, _WalCap, State) ->
+scan_wal(<<>>, _Idx, _WalCap, _BytePos, State) ->
     State;
-scan_wal(Bin, EntrySize, Idx, WalCap, State) when Idx < WalCap ->
-    <<Entry:EntrySize/binary, Rest/binary>> = Bin,
-    <<SlotIdx:32/unsigned-big, FieldId:8, ValueAndMeta/binary>> = Entry,
-    ValueSize = EntrySize - 4 - 1 - 8 - 4,
-    <<Value:ValueSize/binary, Seq:64/unsigned-big, StoredCrc:32/unsigned-big>> = ValueAndMeta,
-    %% Verify CRC: recompute over slot_idx, field_id, value, and seq
-    CrcData = <<SlotIdx:32/unsigned-big, FieldId:8,
-                Value/binary, Seq:64/unsigned-big>>,
-    ComputedCrc = erlang:crc32(CrcData),
-    State1 = case {Seq, ComputedCrc} of
-                 {0, _} ->
-                     %% Empty entry
-                     State;
-                 {_, ComputedCrc} when ComputedCrc =:= StoredCrc ->
-                     %% CRC matches; this entry is valid
-                     %% Skip WAL entries for slots that are marked
-                     %% as deleted/free (e.g., freed slots from
-                     %% delete operations)
-                     case lists:member(SlotIdx, State#shu.free_slots) of
-                         true ->
-                             %% Slot is free, skip orphaned WAL entry
-                             State;
-                         false ->
-                             #shu{wal_tab = Tab, wal_seq = MaxSeq} = State,
-                             Key = {SlotIdx, FieldId},
-                             ShouldInsert =
-                                 case ets:lookup(Tab, Key) of
-                                     [{_, _, ExistingSeq}]
-                                       when ExistingSeq >= Seq ->
-                                         false;
-                                     _ ->
-                                         true
-                                 end,
-                             case ShouldInsert of
-                                 true ->
-                                     true = ets:insert(Tab, {Key, Value, Seq}),
-                                     State#shu{wal_seq = max(MaxSeq, Seq),
-                                               wal_pos = max(State#shu.wal_pos,
-                                                             Idx + 1)};
-                                 false ->
-                                     State
-                             end
-                     end;
-                 {_, _} ->
-                     %% CRC mismatch; torn write detected. Skip this entry.
-                     State
-             end,
-    scan_wal(Rest, EntrySize, Idx + 1, WalCap, State1);
-scan_wal(_, _EntrySize, _Idx, _WalCap, State) ->
+scan_wal(Bin, Idx, WalCap, BytePos, State) when Idx < WalCap ->
+    case Bin of
+        <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest1/binary>> ->
+            case Rest1 of
+                <<Value:ValueLen/binary, Seq:64/unsigned-big, StoredCrc:32/unsigned-big, Rest2/binary>> ->
+                    %% Verify CRC: recompute over slot_idx, field_id, value_len, value, and seq
+                    CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
+                                Value/binary, Seq:64/unsigned-big>>,
+                    ComputedCrc = erlang:crc32(CrcData),
+                    if
+                        Seq =:= 0 ->
+                            %% Empty entry
+                            State;
+                        ComputedCrc =:= StoredCrc ->
+                            %% Valid entry
+                            EntrySize = 4 + 1 + 2 + ValueLen + 8 + 4,
+                            State1 = process_recovered_wal_entry(SlotIdx, FieldId, Value, Seq, BytePos + EntrySize, Idx, State),
+                            scan_wal(Rest2, Idx + 1, WalCap, BytePos + EntrySize, State1);
+                        true ->
+                            %% CRC mismatch; torn write detected. Skip this entry.
+                            State
+                    end;
+                _ ->
+                    %% Incomplete entry
+                    State
+            end;
+        _ ->
+            %% Incomplete header
+            State
+    end;
+scan_wal(_, _Idx, _WalCap, _BytePos, State) ->
     State.
+
+process_recovered_wal_entry(SlotIdx, FieldId, Value, Seq, NextBytePos, Idx, State) ->
+    State1 = State#shu{wal_seq = max(State#shu.wal_seq, Seq),
+                       wal_pos = max(State#shu.wal_pos, Idx + 1),
+                       wal_byte_pos = max(State#shu.wal_byte_pos, NextBytePos)},
+    case lists:member(SlotIdx, State1#shu.free_slots) of
+        true ->
+            %% Slot is free, skip orphaned WAL entry
+            State1;
+        false ->
+            #shu{wal_tab = Tab} = State1,
+            Key = {SlotIdx, FieldId},
+            ShouldInsert =
+                case ets:lookup(Tab, Key) of
+                    [{_, _, ExistingSeq}] when ExistingSeq >= Seq ->
+                        false;
+                    _ ->
+                        true
+                end,
+            case ShouldInsert of
+                true ->
+                    true = ets:insert(Tab, {Key, Value, Seq}),
+                    State1;
+                false ->
+                    State1
+            end
+    end.
 
 %%% ============================================================
 %%% Writes
@@ -749,11 +754,14 @@ classify_fields(Cfg, SlotIdx, FieldValues, State) ->
       end, {[], [], State, false}, FieldValues).
 
 flush_wal_acc(WalWrites, State, WalFull) ->
-    {State1, WalFull1, PWrites} =
+    WalOffset = State#shu.cfg#cfg.wal_offset,
+    StartBytePos = State#shu.wal_byte_pos,
+    {State1, WalFull1, IoList} =
         flush_wal_acc_loop(WalWrites, State, WalFull, []),
-    case PWrites of
+    case IoList of
         [] -> ok;
-        _ -> ok = file:pwrite(State1#shu.fd, lists:reverse(PWrites))
+        _ ->
+            ok = file:pwrite(State1#shu.fd, WalOffset + StartBytePos, lists:reverse(IoList))
     end,
     {State1, WalFull1}.
 
@@ -763,8 +771,8 @@ flush_wal_acc_loop([{SlotIdx, Field, Encoded} | Rest], State, WalFull, Acc) ->
     case prepare_single_wal_entry(SlotIdx, Field, Encoded, State) of
         {ok, State1, undefined} ->
             flush_wal_acc_loop(Rest, State1, WalFull, Acc);
-        {ok, State1, PWrite} ->
-            flush_wal_acc_loop(Rest, State1, WalFull, [PWrite | Acc]);
+        {ok, State1, Entry} ->
+            flush_wal_acc_loop(Rest, State1, WalFull, [Entry | Acc]);
         {wal_full, State1} ->
             flush_wal_acc_loop(Rest, State1, true, Acc)
     end.
@@ -840,29 +848,26 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                         #shu{cfg = Cfg, fd = _Fd,
                              wal_pos = WalPos, wal_seq = WalSeq,
                              wal_count = WalCount, wal_tab = Tab,
+                             wal_byte_pos = WalBytePos,
                              compacting = Compacting,
                              pending_wal = Pending} = State) ->
-    #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize} = Cfg,
+    #cfg{wal_capacity = WalCap} = Cfg,
     case WalPos >= WalCap andalso not Compacting of
         true ->
             {wal_full, State};
         false ->
             Seq = WalSeq + 1,
-            %% Entry format: slot_idx:u32 | field_id:u8 | value:N | seq:u64 | crc:u32
-            %% CRC is computed over slot_idx, field_id, value, and seq.
-            ValueSize = EntrySize - 4 - 1 - 8 - 4,
-            PadSize = ValueSize - byte_size(Encoded),
-            PaddedValue = <<Encoded/binary, 0:(PadSize * 8)>>,
-            CrcData = <<SlotIdx:32/unsigned-big, FieldId:8,
-                        PaddedValue/binary, Seq:64/unsigned-big>>,
+            %% Entry format: slot_idx:u32 | field_id:u8 | value_len:u16 | value:N | seq:u64 | crc:u32
+            %% CRC is computed over slot_idx, field_id, value_len, value, and seq.
+            ValueLen = byte_size(Encoded),
+            CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
+                        Encoded/binary, Seq:64/unsigned-big>>,
             Crc = erlang:crc32(CrcData),
             Entry = <<CrcData/binary, Crc:32/unsigned-big>>,
+            EntrySize = byte_size(Entry),
             EtsKey = {SlotIdx, FieldId},
-            IsNew = case ets:lookup(Tab, EtsKey) of
-                        [] -> true;
-                        _ -> false
-                    end,
-            true = ets:insert(Tab, {EtsKey, PaddedValue, Seq}),
+            IsNew = not ets:member(Tab, EtsKey),
+            true = ets:insert(Tab, {EtsKey, Encoded, Seq}),
             NewWalCount = case IsNew of
                               true -> WalCount + 1;
                               false -> WalCount
@@ -873,11 +878,10 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                                    wal_count = NewWalCount,
                                    pending_wal = [Entry | Pending]}, undefined};
                 false ->
-                    ActualPos = WalPos rem WalCap,
-                    FilePos = wal_entry_pos(Cfg, ActualPos),
                     {ok, State#shu{wal_pos = WalPos + 1,
                                    wal_seq = Seq,
-                                   wal_count = NewWalCount}, {FilePos, Entry}}
+                                   wal_count = NewWalCount,
+                                   wal_byte_pos = WalBytePos + EntrySize}, Entry}
             end
     end.
 
@@ -1089,7 +1093,7 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
     ok = file:sync(Fd),
     true = ets:delete_all_objects(Tab),
     ReversedPending = lists:reverse(Pending),
-    State1 = State#shu{wal_pos = 0, wal_seq = 0,
+    State1 = State#shu{wal_pos = 0, wal_byte_pos = 0, wal_seq = 0,
                         wal_count = 0, compacting = false,
                         pending_wal = []},
     State2 = replay_pending_wal(ReversedPending, Cfg, Fd, Tab, State1),
@@ -1097,30 +1101,26 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
     {ok, State2}.
 
 replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
-    #cfg{wal_capacity = WalCap, wal_entry_size = EntrySize} = Cfg,
-    {State1, PWrites} =
+    WalOffset = Cfg#cfg.wal_offset,
+    StartBytePos = State#shu.wal_byte_pos,
+    {State1, IoList} =
         lists:foldl(
           fun(Entry, {S, Acc}) ->
-                  #shu{wal_pos = WalPos, wal_count = WC} = S,
-                  ActualPos = WalPos rem WalCap,
-                  FilePos = wal_entry_pos(Cfg, ActualPos),
-                  <<SlotIdx:32/unsigned-big, FieldId:8, ValueAndMeta/binary>> = Entry,
-                  ValueSize = EntrySize - 4 - 1 - 8,
-                  <<Value:ValueSize/binary, Seq:64/unsigned-big>> = ValueAndMeta,
+                  #shu{wal_pos = WalPos, wal_count = WC, wal_byte_pos = WBP} = S,
+                  <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest/binary>> = Entry,
+                  <<Value:ValueLen/binary, Seq:64/unsigned-big, _Crc:32/unsigned-big>> = Rest,
                   EtsKey = {SlotIdx, FieldId},
                   IsNew = not ets:member(Tab, EtsKey),
                   true = ets:insert(Tab, {EtsKey, Value, Seq}),
                   S1 = S#shu{wal_pos = WalPos + 1,
                              wal_seq = Seq,
-                             wal_count = WC + (case IsNew of
-                                                   true -> 1;
-                                                   false -> 0
-                                               end)},
-                  {S1, [{FilePos, Entry} | Acc]}
+                             wal_count = WC + (case IsNew of true -> 1; false -> 0 end),
+                             wal_byte_pos = WBP + byte_size(Entry)},
+                  {S1, [Entry | Acc]}
           end, {State, []}, Pending),
-    case PWrites of
+    case IoList of
         [] -> ok;
-        _ -> ok = file:pwrite(Fd, lists:reverse(PWrites))
+        _ -> ok = file:pwrite(Fd, WalOffset + StartBytePos, lists:reverse(IoList))
     end,
     State1.
 
@@ -1356,18 +1356,16 @@ copy_entries_loop([{Key, _SlotIdx} | Rest], OldState, NewState) ->
 flush_pending_wal(#shu{pending_wal = []} = State) ->
     State;
 flush_pending_wal(#shu{pending_wal = Pending, cfg = Cfg, fd = Fd,
-                        wal_pos = WalPos0} = State) ->
-    #cfg{wal_capacity = WalCap} = Cfg,
+                        wal_byte_pos = StartBytePos} = State) ->
+    WalOffset = Cfg#cfg.wal_offset,
     ReversedPending = lists:reverse(Pending),
-    {NewWalPos, PWrites} =
+    {NewWalPos, NewWalBytePos, IoList} =
         lists:foldl(
-          fun(Entry, {Pos, Acc}) ->
-                  ActualPos = Pos rem WalCap,
-                  FilePos = wal_entry_pos(Cfg, ActualPos),
-                  {Pos + 1, [{FilePos, Entry} | Acc]}
-          end, {WalPos0, []}, ReversedPending),
-    case PWrites of
+          fun(Entry, {Pos, BytePos, Acc}) ->
+                  {Pos + 1, BytePos + byte_size(Entry), [Entry | Acc]}
+          end, {State#shu.wal_pos, StartBytePos, []}, ReversedPending),
+    case IoList of
         [] -> ok;
-        _ -> ok = file:pwrite(Fd, lists:reverse(PWrites))
+        _ -> ok = file:pwrite(Fd, WalOffset + StartBytePos, lists:reverse(IoList))
     end,
-    State#shu{pending_wal = [], wal_pos = NewWalPos}.
+    State#shu{pending_wal = [], wal_pos = NewWalPos, wal_byte_pos = NewWalBytePos}.
