@@ -91,6 +91,7 @@ groups() ->
        unknown_field_error]},
      {recovery, [],
       [atom_count_recovery_from_stale_header,
+       reopen_after_header_atom_count_zero_without_atom_table_full,
        sync_basic]},
      {migration, [],
       [migrate_basic,
@@ -867,23 +868,49 @@ atom_count_recovery_from_stale_header(Config) ->
     Info1 = shu:info(S1),
     ?assert(maps:get(atom_count, Info1) >= 2),
     ok = shu:close(S1),
-    
-    %% Simulate stale header by setting atom_count to 0
-    %% (Note: This will cause atoms to not be loaded, which is expected behavior
-    %%  when header count is 0 - only non-zero counts trigger scanning)
+
+    %% Simulate unclean shutdown: header still says atom_count=0 while the atom
+    %% region was populated (shu only writes atom_count on close).
     {ok, Fd} = file:open(File, [read, write, raw, binary]),
     {ok, Header} = file:pread(Fd, 0, 32),
     <<Before:26/binary, _:16, After:4/binary>> = Header,
     StaledHeader = <<Before/binary, 0:16/unsigned-big, After/binary>>,
     ok = file:pwrite(Fd, 0, StaledHeader),
     ok = file:close(Fd),
-    
-    %% Reopen - atom table will be empty (by design, when header says 0)
+
+    %% Reopen must recover atoms from disk despite header atom_count=0
     {ok, S2} = shu:open(File, Schema),
-    %% Info should show 0 atoms
     Info2 = shu:info(S2),
-    ?assertEqual(0, maps:get(atom_count, Info2)),
+    ?assert(maps:get(atom_count, Info2) >= 2),
+    ?assertMatch({ok, {ra, 'ra@node1'}}, shu:read(S2, Key, voted_for)),
     ok = shu:close(S2).
+
+%% Header atom_count=0 while atom slots are filled must not force a full
+%% reload of distinct atoms on the next write (would hit atom_table_full
+%% after 256 even when data already fits in the table).
+reopen_after_header_atom_count_zero_without_atom_table_full(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key1 = make_key(1),
+    Key2 = make_key(2),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key1, voted_for, {ra, 'ra@node1'}),
+    ok = shu:close(S1),
+
+    {ok, Fd} = file:open(File, [read, write, raw, binary]),
+    {ok, Header} = file:pread(Fd, 0, 32),
+    <<Before:26/binary, _:16, After:4/binary>> = Header,
+    StaledHeader = <<Before/binary, 0:16/unsigned-big, After/binary>>,
+    ok = file:pwrite(Fd, 0, StaledHeader),
+    ok = file:close(Fd),
+
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, {ra, 'ra@node1'}}, shu:read(S2, Key1, voted_for)),
+    %% A new row with one new atom pair should still succeed (not re-add all
+    %% prior atoms as if the table were empty).
+    {ok, S3} = shu:write(S2, Key2, voted_for, {rb, 'rb@node2'}),
+    ?assertMatch({ok, {rb, 'rb@node2'}}, shu:read(S3, Key2, voted_for)),
+    ok = shu:close(S3).
 
 sync_basic(Config) ->
     File = ?config(shu_file, Config),

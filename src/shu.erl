@@ -15,6 +15,7 @@
          write/3,
          write_batch/2,
          sync/1,
+         sync_header/1,
          read/3,
          read_all/2,
          delete/2,
@@ -314,20 +315,26 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
     {#{atom() => non_neg_integer()},
      #{non_neg_integer() => atom()},
      non_neg_integer()}.
-load_atom_table(_Fd, _Cfg, 0) ->
-    {#{}, #{}, 0};
 load_atom_table(Fd,
                 #cfg{atom_slot_size = SlotSize,
                      atom_table_offset = AtomOff,
                      atom_table_slots = AtomTableSlots},
                 HeaderAtomCount) ->
     %% Read all atom table slots to find the actual count
-    %% (in case header count is stale due to crash during add_atom)
+    %% (in case header count is stale due to crash during add_atom or before
+    %%  the first shu:close/1, which is the only writer of atom_count).
     TotalSize = AtomTableSlots * SlotSize,
     {ok, Bin} = file:pread(Fd, AtomOff, TotalSize),
-    %% Find first empty slot (Len=0) or use HeaderAtomCount as fallback
+    %% When header says 0, atom slots may still be populated; scan the full
+    %% atom region (same as treating the header as unknown).
+    BoundaryMax = case HeaderAtomCount of
+                      0 -> AtomTableSlots;
+                      N when N > AtomTableSlots -> AtomTableSlots;
+                      N -> N
+                  end,
+    %% Find first empty slot (Len=0) or use BoundaryMax as scan cap
     ActualCount = find_atom_table_boundary(Bin, SlotSize, 0,
-                                           HeaderAtomCount,
+                                           BoundaryMax,
                                            AtomTableSlots),
     %% Now parse up to the actual count
     ParseSize = ActualCount * SlotSize,
@@ -980,6 +987,22 @@ sync(#shu{fd = Fd} = State) ->
     %% is always empty. Just sync the file descriptor.
     case file:sync(Fd) of
         ok -> {ok, State};
+        {error, _} = Err -> Err
+    end.
+
+%% Persist current atom_count to the file header without closing.
+%% Used after bulk writes (e.g. DETS migration) so an unclean shutdown before
+%% the first shu:close/1 does not leave atom_count=0 while the atom region
+%% is already populated.
+-spec sync_header(state()) -> {ok, state()} | {error, term()}.
+sync_header(#shu{compacting = true} = _State) ->
+    {error, compaction_in_progress};
+sync_header(State0) ->
+    State1 = flush_pending_wal(State0),
+    #shu{fd = Fd, cfg = Cfg, atom_count = AtomCount} = State1,
+    ok = write_header(Fd, Cfg, AtomCount),
+    case file:sync(Fd) of
+        ok -> {ok, State1};
         {error, _} = Err -> Err
     end.
 
