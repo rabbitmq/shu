@@ -68,7 +68,11 @@ groups() ->
        compact_from_other_process,
        compact_with_pending_writes,
        compact_then_reopen,
-       delete_then_reopen_orphan_wal]},
+       delete_then_reopen_orphan_wal,
+       delete_during_compaction_no_slot_reuse,
+       compact_pending_wal_bounded,
+       do_compact_bad_file_returns_error,
+       abort_compact_resumes]},
      {batch, [],
       [write_batch_multiple_keys,
        write_batch_single_fsync,
@@ -88,6 +92,7 @@ groups() ->
       [invalid_key_size,
        store_full_error,
        atom_table_full_error,
+       configurable_atom_table_slots,
        unknown_field_error]},
      {recovery, [],
       [atom_count_recovery_from_stale_header,
@@ -1029,3 +1034,125 @@ migrate_during_compaction(Config) ->
     ?assertMatch({ok, 10}, shu:read(S5, <<1, 2, 3, 4>>, value)),
     ?assertMatch({ok, 20}, shu:read(S5, <<5, 6, 7, 8>>, value)),
     ok = shu:close(S5).
+
+%%% ============================================================
+%%% Compaction concurrency / robustness tests
+%%% ============================================================
+
+%% A slot freed by delete/2 during an in-flight compaction must not be reused
+%% by a new key until finish_compact/2, otherwise do_compact/1 (working from
+%% the pre-compaction snapshot) would write the freed slot's data into the
+%% newly-allocated key's record.
+delete_during_compaction_no_slot_reuse(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S0} = shu:open(File, Schema),
+    %% K1 gets slot 0 with a high-freq last_applied value in the WAL
+    {ok, S1} = shu:write(S0, K1, last_applied, 1000),
+    {Work, S2} = shu:prepare_compact(S1),
+    %% delete K1 during compaction -> its slot must be deferred, not freed
+    {ok, S3} = shu:delete(S2, K1),
+    %% a brand new key must NOT reuse K1's slot; it only sets a low-freq field
+    %% (no last_applied), so a reused slot would surface K1's stale 1000
+    {ok, S4} = shu:write(S3, K2, current_term, 7),
+    ok = shu:do_compact(Work),
+    {ok, S5} = shu:finish_compact(ok, S4),
+    ?assertMatch({ok, 7}, shu:read(S5, K2, current_term)),
+    %% the key regression assertion: K2 must not have inherited K1's last_applied
+    ?assertMatch({ok, undefined}, shu:read(S5, K2, last_applied)),
+    ?assertEqual(error, shu:read(S5, K1, current_term)),
+    ok = shu:close(S5).
+
+%% High-frequency writes buffered while compacting must be bounded by wal_size
+%% so the finish_compact/2 replay (which starts at WAL offset 0) can never
+%% overflow the WAL region.
+compact_pending_wal_bounded(Config) ->
+    File = ?config(shu_file, Config),
+    %% one 64-bit high-freq field -> WAL entry size is 4+1+2+9+4 = 20 bytes;
+    %% wal_size 80 holds 4 entries
+    Schema = #{fields => [
+                   #{name => value, type => {integer, 64}, frequency => high}
+               ],
+               key => {binary, 4},
+               expected_count => 4,
+               wal_size => 80},
+    Key = <<1, 2, 3, 4>>,
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, value, 1),
+    {_Work, S2} = shu:prepare_compact(S1),
+    %% buffer high-freq writes while compacting; must hit wal_full once the
+    %% pending buffer would exceed wal_size
+    {Result, _S3} = buffer_until_full(S2, Key, 0, 100),
+    ?assertEqual(wal_full, Result).
+
+buffer_until_full(State, _Key, N, Max) when N >= Max ->
+    {no_wal_full, State};
+buffer_until_full(State, Key, N, Max) ->
+    case shu:write(State, Key, value, N) of
+        {ok, S} -> buffer_until_full(S, Key, N + 1, Max);
+        {wal_full, S} -> {wal_full, S}
+    end.
+
+%% do_compact/1 must return {error, _} (not raise) when it cannot open the file.
+do_compact_bad_file_returns_error(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, make_key(1), last_applied, 5),
+    {Work0, S2} = shu:prepare_compact(S1),
+    BadWork = Work0#{filename => "/nonexistent-dir-shu/does/not/exist.shu"},
+    ?assertMatch({error, _}, shu:do_compact(BadWork)),
+    %% and the store can be recovered via abort_compact/1
+    {ok, S3} = shu:abort_compact(S2),
+    ?assertEqual(false, maps:get(compacting, shu:info(S3))),
+    ok = shu:close(S3).
+
+%% abort_compact/1 returns the store to normal operation after a failed
+%% compaction, preserving the buffered high-freq value (still in the WAL cache)
+%% and allowing writes/reads to continue.
+abort_compact_resumes(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, last_applied, 10),
+    {_Work, S2} = shu:prepare_compact(S1),
+    {ok, S3} = shu:write(S2, Key, last_applied, 42),
+    %% simulate a failed do_compact by aborting instead of finishing
+    {ok, S4} = shu:abort_compact(S3),
+    ?assertEqual(false, maps:get(compacting, shu:info(S4))),
+    %% buffered value is still readable from the WAL cache
+    ?assertMatch({ok, 42}, shu:read(S4, Key, last_applied)),
+    %% normal operation resumes
+    {ok, S5} = shu:write(S4, Key, current_term, 3),
+    ?assertMatch({ok, 3}, shu:read(S5, Key, current_term)),
+    ok = shu:close(S5).
+
+%% atom_table_slots must be configurable so a caller can raise the cap above
+%% the 256 default; distinct atoms beyond 256 then succeed and survive reopen.
+configurable_atom_table_slots(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [
+                   #{name => atom_field, type => {atom, 255},
+                     frequency => low}
+               ],
+               key => {binary, 4},
+               atom_table_slots => 512,
+               expected_count => 1000},
+    {ok, S0} = shu:open(File, Schema),
+    Fill = fun(N, {ok, St}) ->
+                   Key = <<N:32/unsigned-big>>,
+                   Atom = list_to_atom("cfg_atom_" ++ integer_to_list(N)),
+                   shu:write(St, Key, atom_field, Atom);
+              (_, Acc) -> Acc
+           end,
+    %% 300 distinct atoms would exceed the default 256-slot table
+    {ok, S1} = lists:foldl(Fill, {ok, S0}, lists:seq(0, 299)),
+    ?assertMatch({ok, cfg_atom_299}, shu:read(S1, <<299:32/unsigned-big>>, atom_field)),
+    ok = shu:close(S1),
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, cfg_atom_299}, shu:read(S2, <<299:32/unsigned-big>>, atom_field)),
+    ?assertMatch({ok, cfg_atom_0}, shu:read(S2, <<0:32/unsigned-big>>, atom_field)),
+    ok = shu:close(S2).

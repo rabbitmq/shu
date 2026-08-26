@@ -21,6 +21,7 @@
          prepare_compact/1,
          do_compact/1,
          finish_compact/2,
+         abort_compact/1,
          info/1,
          fold/3,
          fold/4,
@@ -61,7 +62,13 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
         FieldMap = maps:from_list(
                      [{F#field.name, F} || F <- FieldRecs]),
         AtomSlotSize = compute_atom_slot_size(Fields),
-        AtomTableSlots = ?DEFAULT_ATOM_TABLE_SLOTS,
+        AtomTableSlots = case maps:get(atom_table_slots, Schema,
+                                       ?DEFAULT_ATOM_TABLE_SLOTS) of
+                             N when is_integer(N), N > 0, N =< 65535 ->
+                                 N;
+                             _ ->
+                                 throw(invalid_atom_table_slots)
+                         end,
         WalSize = maps:get(wal_size, Schema, ?DEFAULT_WAL_SIZE),
         SchemaCrc = compute_schema_crc(Fields, MaxKeySize),
         AtomTableOffset = ?HEADER_SIZE,
@@ -820,12 +827,23 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                              wal_tab = Tab,
                              wal_byte_pos = WalBytePos,
                              compacting = Compacting,
-                             pending_wal = Pending} = State) ->
+                             pending_wal = Pending,
+                             pending_bytes = PendingBytes} = State) ->
     #cfg{wal_size = WalSize} = Cfg,
     %% Calculate entry size first to check if it fits
     ValueLen = byte_size(Encoded),
     EntrySize = 4 + 1 + 2 + ValueLen + 4,
-    case WalBytePos + EntrySize > WalSize andalso not Compacting of
+    %% Enforce the WAL size ceiling whether the entry is written directly
+    %% (bounded by wal_byte_pos) or buffered while compacting (bounded by
+    %% pending_bytes, which finish_compact/2 replays from WAL offset 0).
+    %% Without the pending bound a slow compaction under write pressure could
+    %% buffer more than wal_size bytes and silently lose the tail on the next
+    %% recovery.
+    Used = case Compacting of
+               true -> PendingBytes;
+               false -> WalBytePos
+           end,
+    case Used + EntrySize > WalSize of
         true ->
             {wal_full, State};
         false ->
@@ -839,7 +857,9 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
             true = ets:insert(Tab, {EtsKey, Encoded}),
             case Compacting of
                 true ->
-                    {ok, State#shu{pending_wal = [Entry | Pending]}, undefined};
+                    {ok, State#shu{pending_wal = [Entry | Pending],
+                                   pending_bytes = PendingBytes + EntrySize},
+                     undefined};
                 false ->
                     {ok, State#shu{wal_byte_pos = WalBytePos + EntrySize}, Entry}
             end
@@ -948,7 +968,9 @@ read_field_from_file(SlotIdx, #field{size = Size} = Field,
     {ok, state()} | {error, term()}.
 delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
              free_slots = Free, slot_count = SC,
-             wal_tab = Tab} = State, Key) ->
+             wal_tab = Tab,
+             compacting = Compacting,
+             pending_free = PendingFree} = State, Key) ->
     case K2S of
         #{Key := SlotIdx} ->
             Pos = key_index_pos(Cfg, SlotIdx),
@@ -958,9 +980,19 @@ delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
                       ets:delete(Tab, {SlotIdx, FieldId})
               end, Cfg#cfg.fields),
             ok = file:sync(Fd),
-            {ok, State#shu{key_to_slot = maps:remove(Key, K2S),
-                           free_slots = [SlotIdx | Free],
-                           slot_count = SC - 1}};
+            State1 = State#shu{key_to_slot = maps:remove(Key, K2S),
+                               slot_count = SC - 1},
+            %% While a compaction is in flight the freed slot must not be
+            %% reused: do_compact/1 works from a snapshot taken at
+            %% prepare_compact/1 that still contains this slot's data and would
+            %% write it into whichever key next reused the slot. Defer freeing
+            %% until finish_compact/2.
+            case Compacting of
+                true ->
+                    {ok, State1#shu{pending_free = [SlotIdx | PendingFree]}};
+                false ->
+                    {ok, State1#shu{free_slots = [SlotIdx | Free]}}
+            end;
         _ ->
             {error, not_found}
     end.
@@ -997,41 +1029,48 @@ prepare_compact(#shu{cfg = Cfg, wal_tab = Tab,
              entries => Entries,
              atom_to_idx => A2I,
              idx_to_atom => I2A},
-    {Work, State#shu{compacting = true, pending_wal = []}}.
+    {Work, State#shu{compacting = true, pending_wal = [], pending_bytes = 0}}.
 
 -spec do_compact(compact_work()) -> compact_result().
 do_compact(#{filename := Filename, cfg := Cfg,
              entries := Entries}) ->
-    {ok, Fd} = file:open(Filename, [read, write, raw, binary]),
-    try
-        %% Build a map for O(1) field lookups instead of O(N*M) linear search
-        FieldMap = maps:from_list(
-                     [{FieldId, Field} ||
-                      #field{id = FieldId} = Field <- Cfg#cfg.fields]),
-        PWrites = lists:filtermap(
-                    fun({{SlotIdx, FieldId}, ValueBin}) ->
-                            case maps:find(FieldId, FieldMap) of
-                                {ok, #field{size = Size} = Field} ->
-                                    Pos = field_pos(Cfg, SlotIdx, Field),
-                                    Bin = fit_to_size(ValueBin, Size),
-                                    {true, {Pos, Bin}};
-                                error ->
-                                    false
-                            end
-                    end, Entries),
-        %% Sort pwrite operations by position for better I/O locality
-        SortedWrites = lists:keysort(1, PWrites),
-        case SortedWrites of
-            [] -> ok;
-            _ -> ok = file:pwrite(Fd, SortedWrites)
-        end,
-        ok = file:sync(Fd),
-        ok
-    catch
-        _:Reason ->
+    %% Open the fd inside the guarded region so a failure (e.g. EMFILE) is
+    %% returned as {error, Reason} rather than raising a badmatch, which would
+    %% make the worker exit with an opaque reason.
+    case file:open(Filename, [read, write, raw, binary]) of
+        {ok, Fd} ->
+            try
+                %% Build a map for O(1) field lookups instead of O(N*M) linear search
+                FieldMap = maps:from_list(
+                             [{FieldId, Field} ||
+                              #field{id = FieldId} = Field <- Cfg#cfg.fields]),
+                PWrites = lists:filtermap(
+                            fun({{SlotIdx, FieldId}, ValueBin}) ->
+                                    case maps:find(FieldId, FieldMap) of
+                                        {ok, #field{size = Size} = Field} ->
+                                            Pos = field_pos(Cfg, SlotIdx, Field),
+                                            Bin = fit_to_size(ValueBin, Size),
+                                            {true, {Pos, Bin}};
+                                        error ->
+                                            false
+                                    end
+                            end, Entries),
+                %% Sort pwrite operations by position for better I/O locality
+                SortedWrites = lists:keysort(1, PWrites),
+                case SortedWrites of
+                    [] -> ok;
+                    _ -> ok = file:pwrite(Fd, SortedWrites)
+                end,
+                ok = file:sync(Fd),
+                ok
+            catch
+                _:Reason ->
+                    {error, Reason}
+            after
+                file:close(Fd)
+            end;
+        {error, Reason} ->
             {error, Reason}
-    after
-        file:close(Fd)
     end.
 
 -spec finish_compact(compact_result(), state()) ->
@@ -1039,19 +1078,44 @@ do_compact(#{filename := Filename, cfg := Cfg,
 finish_compact({error, _} = Err, _State) ->
     Err;
 finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
-                         pending_wal = Pending} = State) ->
+                         pending_wal = Pending,
+                         free_slots = Free,
+                         pending_free = PendingFree} = State) ->
     #cfg{wal_offset = WalOff} = Cfg,
     {ok, _} = file:position(Fd, WalOff),
     ok = file:truncate(Fd),
     ok = file:sync(Fd),
     true = ets:delete_all_objects(Tab),
     ReversedPending = lists:reverse(Pending),
+    %% Slots freed by delete/2 during the compaction were held in pending_free
+    %% so do_compact could not clobber a reused slot. The compaction is done,
+    %% so they can now be released for reuse.
     State1 = State#shu{wal_byte_pos = 0,
                         compacting = false,
-                        pending_wal = []},
+                        pending_wal = [],
+                        pending_bytes = 0,
+                        pending_free = [],
+                        free_slots = PendingFree ++ Free},
     State2 = replay_pending_wal(ReversedPending, Cfg, Fd, Tab, State1),
     ok = file:sync(Fd),
     {ok, State2}.
+
+%% Recover from a failed compaction (do_compact returned {error, _}). do_compact
+%% only writes snapshot values (which are also in the WAL / WAL cache) into the
+%% record area and never mutates the WAL region or key index, so the file is
+%% still in its pre-compaction state. Return to normal operation: the buffered
+%% pending_wal values remain in the WAL ETS cache and will be captured by the
+%% next prepare_compact, so the pending buffer is dropped here; wal_byte_pos is
+%% left untouched so the next write again hits wal_full and retries compaction.
+-spec abort_compact(state()) -> {ok, state()}.
+abort_compact(#shu{compacting = false} = State) ->
+    {ok, State};
+abort_compact(#shu{free_slots = Free, pending_free = PendingFree} = State) ->
+    {ok, State#shu{compacting = false,
+                   pending_wal = [],
+                   pending_bytes = 0,
+                   pending_free = [],
+                   free_slots = PendingFree ++ Free}}.
 
 replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
     WalOffset = Cfg#cfg.wal_offset,

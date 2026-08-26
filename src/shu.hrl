@@ -35,7 +35,8 @@
 -type schema() :: #{fields := [field_spec()],
                     key := {binary, pos_integer()},
                     expected_count => pos_integer(),
-              wal_size => pos_integer()}.
+                    atom_table_slots => pos_integer(),
+                    wal_size => pos_integer()}.
 
 -record(field, {name :: atom(),
                 id :: non_neg_integer(),
@@ -73,7 +74,16 @@
               wal_byte_pos = 0 :: non_neg_integer(),
               wal_tab :: ets:tid(),
               compacting = false :: boolean(),
-              pending_wal = [] :: [iodata()]}).
+              pending_wal = [] :: [iodata()],
+              %% bytes buffered in pending_wal while compacting; bounded by
+              %% wal_size so the finish_compact replay can never overflow the
+              %% WAL region
+              pending_bytes = 0 :: non_neg_integer(),
+              %% slots freed by delete/2 while a compaction is in flight. They
+              %% cannot be reused until finish_compact completes, otherwise the
+              %% compaction worker would write the freed slot's snapshotted
+              %% data into a newly-allocated key's record.
+              pending_free = [] :: [non_neg_integer()]}).
 
 -opaque compact_work() :: map().
 
