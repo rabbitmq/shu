@@ -16,6 +16,10 @@
 -define(SLOT_ACTIVE, 1).
 -define(SLOT_DELETED, 2).
 
+%% Fixed overhead of a key-index entry: status(1) + generation(8) + key_len(1).
+%% A full entry is ?KI_OVERHEAD + max_key_size bytes.
+-define(KI_OVERHEAD, 10).
+
 -define(DEFAULT_EXPECTED_COUNT, 1024).
 -define(DEFAULT_ATOM_TABLE_SLOTS, 256).
 -define(DEFAULT_WAL_SIZE, 16777216). % 16MB default WAL size
@@ -35,7 +39,8 @@
 -type schema() :: #{fields := [field_spec()],
                     key := {binary, pos_integer()},
                     expected_count => pos_integer(),
-              wal_size => pos_integer()}.
+                    atom_table_slots => pos_integer(),
+                    wal_size => pos_integer()}.
 
 -record(field, {name :: atom(),
                 id :: non_neg_integer(),
@@ -67,13 +72,32 @@
               key_to_slot = #{} :: #{binary() => non_neg_integer()},
               next_free = 0 :: non_neg_integer(),
               free_slots = [] :: [non_neg_integer()],
+              %% Generation of each ACTIVE slot. A slot's generation is bumped
+              %% (to a store-wide-monotonic next_gen) each time the slot is
+              %% (re)allocated to a key, and it is removed here when the slot is
+              %% deleted. Every WAL entry is tagged with the writing slot's
+              %% generation; on recovery/replay an entry is applied only if its
+              %% generation still matches slot_gen, so a stale entry left by a
+              %% previous owner of a reused slot can never resurrect - regardless
+              %% of crash timing or whether the WAL was truncated.
+              slot_gen = #{} :: #{non_neg_integer() => non_neg_integer()},
+              next_gen = 0 :: non_neg_integer(),
               atom_to_idx = #{} :: #{atom() => non_neg_integer()},
               idx_to_atom = #{} :: #{non_neg_integer() => atom()},
               atom_count = 0 :: non_neg_integer(),
               wal_byte_pos = 0 :: non_neg_integer(),
               wal_tab :: ets:tid(),
               compacting = false :: boolean(),
-              pending_wal = [] :: [iodata()]}).
+              pending_wal = [] :: [iodata()],
+              %% bytes buffered in pending_wal while compacting; bounded by
+              %% wal_size so the finish_compact replay can never overflow the
+              %% WAL region
+              pending_bytes = 0 :: non_neg_integer(),
+              %% slots freed by delete/2 while a compaction is in flight. They
+              %% cannot be reused until the compaction completes, otherwise the
+              %% compaction worker (which writes the pre-compaction snapshot into
+              %% the record area) would clobber a newly-allocated key's record.
+              pending_free = [] :: [non_neg_integer()]}).
 
 -opaque compact_work() :: map().
 
