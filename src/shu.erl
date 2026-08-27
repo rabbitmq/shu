@@ -73,7 +73,7 @@ validate_schema(#{fields := Fields, key := {binary, MaxKeySize}} = Schema)
         SchemaCrc = compute_schema_crc(Fields, MaxKeySize),
         AtomTableOffset = ?HEADER_SIZE,
         KeyIndexOffset = AtomTableOffset + AtomTableSlots * AtomSlotSize,
-        KeyIndexEntrySize = 1 + 1 + MaxKeySize,
+        KeyIndexEntrySize = ?KI_OVERHEAD + MaxKeySize,
         RecordOffset = KeyIndexOffset + ExpectedCount * KeyIndexEntrySize,
         WalOffset = RecordOffset + ExpectedCount * RecordSize,
         Cfg = #cfg{filename = undefined,
@@ -294,7 +294,7 @@ ensure_atom(Atom, #shu{atom_to_idx = A2I} = State) ->
     {ok, non_neg_integer(), #shu{}} | {error, atom_table_full}.
 add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
                                 atom_table_offset = AtomOff,
-                                atom_table_slots = AtomTableSlots},
+                                atom_table_slots = AtomTableSlots} = Cfg,
                      fd = Fd,
                      atom_to_idx = A2I,
                      idx_to_atom = I2A,
@@ -312,9 +312,19 @@ add_atom(Atom, #shu{cfg = #cfg{atom_slot_size = SlotSize,
             Pos = AtomOff + Idx * SlotSize,
             ok = prim_file:pwrite(Fd, Pos, Entry),
             ok = prim_file:sync(Fd),
+            NewCount = Count + 1,
+            %% Persist the bumped atom_count in the header immediately. The
+            %% header is otherwise only rewritten on a clean close, so a crash
+            %% before then would leave load_atom_table trusting a stale count
+            %% and silently dropping every atom added this session (e.g. a
+            %% voted_for node name), corrupting recovery. Writing the header
+            %% here, before the field that references this atom is written,
+            %% keeps recovery consistent.
+            ok = write_header(Fd, Cfg, NewCount),
+            ok = prim_file:sync(Fd),
             {ok, Idx, State#shu{atom_to_idx = A2I#{Atom => Idx},
                                 idx_to_atom = I2A#{Idx => Atom},
-                                atom_count = Count + 1}}
+                                atom_count = NewCount}}
     end.
 
 -spec load_atom_table(file:io_device(), #cfg{}, non_neg_integer()) ->
@@ -325,21 +335,17 @@ load_atom_table(_Fd, _Cfg, 0) ->
     {#{}, #{}, 0};
 load_atom_table(Fd,
                 #cfg{atom_slot_size = SlotSize,
-                     atom_table_offset = AtomOff,
-                     atom_table_slots = AtomTableSlots},
+                     atom_table_offset = AtomOff},
                 HeaderAtomCount) ->
-    %% Read all atom table slots to find the actual count
-    %% (in case header count is stale due to crash during add_atom)
-    TotalSize = AtomTableSlots * SlotSize,
-    {ok, Bin} = file:pread(Fd, AtomOff, TotalSize),
-    %% Find first empty slot (Len=0) or use HeaderAtomCount as fallback
-    ActualCount = find_atom_table_boundary(Bin, SlotSize, 0,
-                                           HeaderAtomCount,
-                                           AtomTableSlots),
-    %% Now parse up to the actual count
-    ParseSize = ActualCount * SlotSize,
-    <<ParseBin:ParseSize/binary, _/binary>> = Bin,
-    parse_atom_table(ParseBin, SlotSize, 0, ActualCount, #{}, #{}).
+    %% The header atom_count is authoritative: add_atom/2 persists it (with an
+    %% fsync) before the field that references the new atom is written, so a
+    %% crash never leaves the header under-counting a committed atom. Parse
+    %% exactly that many slots. This also correctly handles an empty-atom slot
+    %% (Len=0), which the previous "scan to the first empty slot" heuristic would
+    %% have mistaken for the end of the table.
+    ParseSize = HeaderAtomCount * SlotSize,
+    {ok, Bin} = file:pread(Fd, AtomOff, ParseSize),
+    parse_atom_table(Bin, SlotSize, 0, HeaderAtomCount, #{}, #{}).
 
 parse_atom_table(_Bin, _SlotSize, Idx, AtomCount, A2I, I2A)
   when Idx >= AtomCount ->
@@ -352,30 +358,12 @@ parse_atom_table(Bin, SlotSize, Idx, AtomCount, A2I, I2A) ->
     parse_atom_table(Rest, SlotSize, Idx + 1, AtomCount,
                      A2I#{Atom => Idx}, I2A#{Idx => Atom}).
 
-find_atom_table_boundary(_Bin, _SlotSize, Idx, MaxIdx, TableSlots)
-  when Idx >= MaxIdx orelse Idx >= TableSlots ->
-    %% Reached header count or table limit without finding empty slot
-    Idx;
-find_atom_table_boundary(Bin, SlotSize, Idx, MaxIdx, TableSlots) ->
-    %% Check if this slot is empty (first 2 bytes = 0 means Len=0)
-    <<Entry:SlotSize/binary, Rest/binary>> = Bin,
-    <<Len:16/unsigned-big, _/binary>> = Entry,
-    case Len of
-        0 ->
-            %% Found first empty slot, actual count is Idx
-            Idx;
-        _ ->
-            %% Slot occupied, continue scanning
-            find_atom_table_boundary(Rest, SlotSize, Idx + 1, MaxIdx,
-                                     TableSlots)
-    end.
-
 %%% ============================================================
 %%% File addressing helpers
 %%% ============================================================
 
 key_index_pos(#cfg{key_index_offset = Off, max_key_size = MKS}, SlotIdx) ->
-    Off + SlotIdx * (1 + 1 + MKS).
+    Off + SlotIdx * (?KI_OVERHEAD + MKS).
 
 record_pos(#cfg{record_offset = Off, record_size = RS}, SlotIdx) ->
     Off + SlotIdx * RS.
@@ -472,7 +460,7 @@ create_new(Filename, #cfg{num_slots = NumSlots,
                            atom_slot_size = AtomSlotSize} = Cfg) ->
     {ok, Fd} = file:open(Filename, [read, write, raw, binary]),
     ok = write_header(Fd, Cfg, 0),
-    KeyIndexSize = NumSlots * (1 + 1 + MaxKeySize),
+    KeyIndexSize = NumSlots * (?KI_OVERHEAD + MaxKeySize),
     RecordAreaSize = NumSlots * RecordSize,
     TotalSize = ?HEADER_SIZE +
                 AtomTableSlots * AtomSlotSize +
@@ -499,7 +487,7 @@ open_existing(Filename, #cfg{schema_crc = ExpectedCrc} = Cfg0) ->
             AtomTableOffset = ?HEADER_SIZE,
             KeyIndexOffset = AtomTableOffset + AtomTableSlots * AtomSlotSize,
             RecordOffset = KeyIndexOffset +
-                           NumSlots * (1 + 1 + Cfg0#cfg.max_key_size),
+                           NumSlots * (?KI_OVERHEAD + Cfg0#cfg.max_key_size),
             WalOffset = RecordOffset + NumSlots * Cfg0#cfg.record_size,
             Cfg = Cfg0#cfg{num_slots = NumSlots,
                            atom_slot_size = AtomSlotSize,
@@ -554,32 +542,39 @@ close(State0) ->
 recover_key_index(Fd, #cfg{max_key_size = MaxKeySize,
                            num_slots = NumSlots} = Cfg,
                   State0) ->
-    EntrySize = 1 + 1 + MaxKeySize,
+    EntrySize = ?KI_OVERHEAD + MaxKeySize,
     TotalSize = NumSlots * EntrySize,
     if TotalSize > 0 ->
             StartPos = key_index_pos(Cfg, 0),
             {ok, Bin} = file:pread(Fd, StartPos, TotalSize),
-            scan_key_index(Bin, MaxKeySize, 0, NumSlots, State0);
+            State1 = scan_key_index(Bin, MaxKeySize, 0, NumSlots, State0, 0),
+            %% next_gen must exceed every generation ever stored (active OR
+            %% deleted), so a reused slot always gets a strictly-higher
+            %% generation than any it held before.
+            State1;
        true ->
             State0
     end.
 
-scan_key_index(_Bin, _MaxKeySize, Idx, NumSlots, State)
+scan_key_index(_Bin, _MaxKeySize, Idx, NumSlots, State, MaxGen)
   when Idx >= NumSlots ->
-    State;
+    State#shu{next_gen = MaxGen + 1};
 scan_key_index(Bin, MaxKeySize, Idx, NumSlots,
                #shu{key_to_slot = K2S, free_slots = Free,
-                    slot_count = SC} = State) ->
-    <<Status:8, KeyLen:8, KeyData:MaxKeySize/binary, Rest/binary>> = Bin,
+                    slot_gen = SlotGen, slot_count = SC} = State, MaxGen) ->
+    <<Status:8, Gen:64/unsigned-big, KeyLen:8, KeyData:MaxKeySize/binary,
+      Rest/binary>> = Bin,
+    MaxGen1 = max(MaxGen, Gen),
     case Status of
         ?SLOT_ACTIVE ->
             <<Key:KeyLen/binary, _/binary>> = KeyData,
             scan_key_index(Rest, MaxKeySize, Idx + 1, NumSlots,
                            State#shu{key_to_slot = K2S#{Key => Idx},
-                                     slot_count = SC + 1});
+                                     slot_gen = SlotGen#{Idx => Gen},
+                                     slot_count = SC + 1}, MaxGen1);
         _ ->
             scan_key_index(Rest, MaxKeySize, Idx + 1, NumSlots,
-                           State#shu{free_slots = [Idx | Free]})
+                           State#shu{free_slots = [Idx | Free]}, MaxGen1)
     end.
 
 recover_wal(Fd, #cfg{wal_size = WalSize,
@@ -606,21 +601,23 @@ scan_wal(<<>>, _Idx, _WalSize, _BytePos, State) ->
     State;
 scan_wal(Bin, Idx, WalSize, BytePos, State) when BytePos < WalSize ->
     case Bin of
-        <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest1/binary>> ->
+        <<SlotIdx:32/unsigned-big, Gen:64/unsigned-big, FieldId:8,
+          ValueLen:16/unsigned-big, Rest1/binary>> ->
             case Rest1 of
                 <<Value:ValueLen/binary, StoredCrc:32/unsigned-big, Rest2/binary>> ->
-                    %% Verify CRC: recompute over slot_idx, field_id, value_len, and value
-                    CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
-                                Value/binary>>,
+                    %% Verify CRC over slot_idx, gen, field_id, value_len, value
+                    CrcData = <<SlotIdx:32/unsigned-big, Gen:64/unsigned-big, FieldId:8,
+                                ValueLen:16/unsigned-big, Value/binary>>,
                     ComputedCrc = erlang:crc32(CrcData),
                     if
-                        SlotIdx =:= 0 andalso FieldId =:= 0 andalso ValueLen =:= 0 ->
+                        SlotIdx =:= 0 andalso Gen =:= 0 andalso FieldId =:= 0
+                        andalso ValueLen =:= 0 ->
                             %% Empty entry (pre-allocated zeros)
                             State;
                         ComputedCrc =:= StoredCrc ->
                             %% Valid entry
-                            EntrySize = 4 + 1 + 2 + ValueLen + 4,
-                            State1 = process_recovered_wal_entry(SlotIdx, FieldId, Value, BytePos + EntrySize, State),
+                            EntrySize = 4 + 8 + 1 + 2 + ValueLen + 4,
+                            State1 = process_recovered_wal_entry(SlotIdx, Gen, FieldId, Value, BytePos + EntrySize, State),
                             scan_wal(Rest2, Idx + 1, WalSize, BytePos + EntrySize, State1);
                         true ->
                             %% CRC mismatch; torn write detected. Skip this entry.
@@ -637,16 +634,26 @@ scan_wal(Bin, Idx, WalSize, BytePos, State) when BytePos < WalSize ->
 scan_wal(_, _Idx, _WalSize, _BytePos, State) ->
     State.
 
-process_recovered_wal_entry(SlotIdx, FieldId, Value, NextBytePos, State) ->
-    State1 = State#shu{wal_byte_pos = max(State#shu.wal_byte_pos, NextBytePos)},
-    case lists:member(SlotIdx, State1#shu.free_slots) of
-        true ->
-            %% Slot is free, skip orphaned WAL entry
-            State1;
-        false ->
+process_recovered_wal_entry(SlotIdx, Gen, FieldId, Value, NextBytePos, State) ->
+    %% next_gen must exceed EVERY generation present on disk, including this WAL
+    %% entry's. A high-frequency write is not fsynced, and neither is the
+    %% key-index write that records the slot's generation, so a crash can leave a
+    %% durable WAL entry tagged gen G whose key-index generation was lost. If
+    %% next_gen were derived from the key index alone it could regress to <= G, a
+    %% later allocation could re-issue G, and this still-present entry would then
+    %% match the reused slot. Bumping next_gen past every surviving entry's
+    %% generation (even skipped ones) prevents that reuse.
+    State1 = State#shu{wal_byte_pos = max(State#shu.wal_byte_pos, NextBytePos),
+                       next_gen = max(State#shu.next_gen, Gen + 1)},
+    %% Apply the entry only if its generation still matches the slot's current
+    %% generation. A slot that is free (not in slot_gen) or has been reused (new
+    %% generation) yields a mismatch, so a previous owner's entries are dropped.
+    case maps:get(SlotIdx, State1#shu.slot_gen, undefined) of
+        Gen ->
             #shu{wal_tab = Tab} = State1,
-            Key = {SlotIdx, FieldId},
-            true = ets:insert(Tab, {Key, Value}),
+            true = ets:insert(Tab, {{SlotIdx, FieldId}, Value}),
+            State1;
+        _ ->
             State1
     end.
 
@@ -767,6 +774,8 @@ allocate_slot(Key, #shu{cfg = Cfg, fd = Fd,
                          free_slots = Free,
                          next_free = NextFree,
                          key_to_slot = K2S,
+                         slot_gen = SlotGen,
+                         next_gen = NextGen,
                          slot_count = SC} = State) ->
     #cfg{max_key_size = MaxKeySize, num_slots = NumSlots} = Cfg,
     KeyLen = byte_size(Key),
@@ -774,18 +783,38 @@ allocate_slot(Key, #shu{cfg = Cfg, fd = Fd,
         false ->
             {error, {invalid_key_size, KeyLen, MaxKeySize}};
         true ->
+            %% Every allocation (fresh or reused) gets a fresh, store-wide
+            %% monotonic generation. A reused slot therefore gets a generation
+            %% strictly greater than any it held before, so its previous owner's
+            %% WAL entries (tagged with the old generation) are skipped on
+            %% replay/recovery and cannot leak to the new key.
+            Gen = NextGen,
             case Free of
                 [SlotIdx | Rest] ->
-                    write_key_index_entry(Fd, Cfg, SlotIdx, Key),
+                    %% A reused slot still holds the previous key's record-area
+                    %% field values (low-frequency fields and the last compacted
+                    %% high-frequency value); the generation only guards the WAL.
+                    %% Clear the record area before the slot becomes active, and
+                    %% fsync the clear BEFORE marking the slot active so a crash
+                    %% cannot leave a durably-active reused slot with the deleted
+                    %% key's stale record. (The slot cannot be reused
+                    %% mid-compaction, so do_compact cannot race this.)
+                    ok = clear_record_slot(Fd, Cfg, SlotIdx),
+                    ok = file:sync(Fd),
+                    write_key_index_entry(Fd, Cfg, SlotIdx, Key, Gen),
                     {ok, SlotIdx,
                      State#shu{free_slots = Rest,
                                key_to_slot = K2S#{Key => SlotIdx},
+                               slot_gen = SlotGen#{SlotIdx => Gen},
+                               next_gen = NextGen + 1,
                                slot_count = SC + 1}};
                 [] when NextFree < NumSlots ->
-                    write_key_index_entry(Fd, Cfg, NextFree, Key),
+                    write_key_index_entry(Fd, Cfg, NextFree, Key, Gen),
                     {ok, NextFree,
                      State#shu{next_free = NextFree + 1,
                                key_to_slot = K2S#{Key => NextFree},
+                               slot_gen = SlotGen#{NextFree => Gen},
+                               next_gen = NextGen + 1,
                                slot_count = SC + 1}};
                 [] ->
                     {error, store_full}
@@ -793,12 +822,18 @@ allocate_slot(Key, #shu{cfg = Cfg, fd = Fd,
     end.
 
 write_key_index_entry(Fd, #cfg{max_key_size = MaxKeySize} = Cfg,
-                      SlotIdx, Key) ->
+                      SlotIdx, Key, Gen) ->
     Pos = key_index_pos(Cfg, SlotIdx),
     KeyLen = byte_size(Key),
     PadSize = MaxKeySize - KeyLen,
-    ok = file:pwrite(Fd, Pos, <<?SLOT_ACTIVE:8, KeyLen:8,
+    ok = file:pwrite(Fd, Pos, <<?SLOT_ACTIVE:8, Gen:64/unsigned-big, KeyLen:8,
                                  Key/binary, 0:(PadSize * 8)>>).
+
+%% Zero a record slot so a reused slot does not surface the previous key's
+%% field values. All-zero bytes decode as 'undefined' for every field type.
+clear_record_slot(Fd, #cfg{record_size = RecordSize} = Cfg, SlotIdx) ->
+    Pos = record_pos(Cfg, SlotIdx),
+    ok = file:pwrite(Fd, Pos, <<0:(RecordSize * 8)>>).
 
 do_write_fields(Cfg, SlotIdx, FieldValues, State) ->
     {LowWrites, WalWrites, State1, NeedSync} =
@@ -825,14 +860,18 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
                         Encoded,
                         #shu{cfg = Cfg, fd = _Fd,
                              wal_tab = Tab,
+                             slot_gen = SlotGen,
                              wal_byte_pos = WalBytePos,
                              compacting = Compacting,
                              pending_wal = Pending,
                              pending_bytes = PendingBytes} = State) ->
     #cfg{wal_size = WalSize} = Cfg,
+    %% Tag the entry with the slot's current generation so a stale entry from a
+    %% previous owner of a reused slot is skipped on replay/recovery.
+    Gen = maps:get(SlotIdx, SlotGen, 0),
     %% Calculate entry size first to check if it fits
     ValueLen = byte_size(Encoded),
-    EntrySize = 4 + 1 + 2 + ValueLen + 4,
+    EntrySize = 4 + 8 + 1 + 2 + ValueLen + 4,
     %% Enforce the WAL size ceiling whether the entry is written directly
     %% (bounded by wal_byte_pos) or buffered while compacting (bounded by
     %% pending_bytes, which finish_compact/2 replays from WAL offset 0).
@@ -847,10 +886,10 @@ prepare_single_wal_entry(SlotIdx, #field{id = FieldId},
         true ->
             {wal_full, State};
         false ->
-            %% Entry format: slot_idx:u32 | field_id:u8 | value_len:u16 | value:N | crc:u32
-            %% CRC is computed over slot_idx, field_id, value_len, and value.
-            CrcData = <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big,
-                        Encoded/binary>>,
+            %% Entry format: slot_idx:u32 | gen:u32 | field_id:u8 | value_len:u16 | value:N | crc:u32
+            %% CRC is computed over slot_idx, gen, field_id, value_len, and value.
+            CrcData = <<SlotIdx:32/unsigned-big, Gen:64/unsigned-big, FieldId:8,
+                        ValueLen:16/unsigned-big, Encoded/binary>>,
             Crc = erlang:crc32(CrcData),
             Entry = <<CrcData/binary, Crc:32/unsigned-big>>,
             EtsKey = {SlotIdx, FieldId},
@@ -969,26 +1008,33 @@ read_field_from_file(SlotIdx, #field{size = Size} = Field,
 delete(#shu{cfg = Cfg, fd = Fd, key_to_slot = K2S,
              free_slots = Free, slot_count = SC,
              wal_tab = Tab,
+             slot_gen = SlotGen,
              compacting = Compacting,
              pending_free = PendingFree} = State, Key) ->
     case K2S of
         #{Key := SlotIdx} ->
             Pos = key_index_pos(Cfg, SlotIdx),
+            %% Overwrites only the status byte, preserving the slot's stored
+            %% generation (used to compute next_gen on recovery).
             ok = file:pwrite(Fd, Pos, <<?SLOT_DELETED:8>>),
             lists:foreach(
               fun(#field{id = FieldId}) ->
                       ets:delete(Tab, {SlotIdx, FieldId})
               end, Cfg#cfg.fields),
             ok = file:sync(Fd),
+            %% Drop the slot's generation: it is no longer active, so any WAL
+            %% entries tagged with it are skipped on replay/recovery. If the slot
+            %% is later reused it gets a new, higher generation, so the previous
+            %% owner's entries can never match again.
             State1 = State#shu{key_to_slot = maps:remove(Key, K2S),
+                               slot_gen = maps:remove(SlotIdx, SlotGen),
                                slot_count = SC - 1},
-            %% While a compaction is in flight the freed slot must not be
-            %% reused: do_compact/1 works from a snapshot taken at
-            %% prepare_compact/1 that still contains this slot's data and would
-            %% write it into whichever key next reused the slot. Defer freeing
-            %% until finish_compact/2.
             case Compacting of
                 true ->
+                    %% Defer freeing the slot until the compaction completes: the
+                    %% compaction worker writes the pre-compaction snapshot into
+                    %% the record area, so the slot must not be reused (and its
+                    %% record cleared) until then.
                     {ok, State1#shu{pending_free = [SlotIdx | PendingFree]}};
                 false ->
                     {ok, State1#shu{free_slots = [SlotIdx | Free]}}
@@ -1081,6 +1127,12 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
                          pending_wal = Pending,
                          free_slots = Free,
                          pending_free = PendingFree} = State) ->
+    %% The file operations below match strictly on ok. A disk-level failure
+    %% (ENOSPC/EIO) therefore raises rather than returning {error, _}, crashing
+    %% the caller. That is intentional: a durable store cannot proceed past a
+    %% failed truncate/sync, and the restart recovers from the still-present
+    %% WAL. A partial-failure "graceful" path (e.g. truncate succeeded, sync
+    %% failed) would risk a worse inconsistent state than a clean crash+recover.
     #cfg{wal_offset = WalOff} = Cfg,
     {ok, _} = file:position(Fd, WalOff),
     ok = file:truncate(Fd),
@@ -1107,6 +1159,11 @@ finish_compact(ok, #shu{cfg = Cfg, fd = Fd, wal_tab = Tab,
 %% pending_wal values remain in the WAL ETS cache and will be captured by the
 %% next prepare_compact, so the pending buffer is dropped here; wal_byte_pos is
 %% left untouched so the next write again hits wal_full and retries compaction.
+%%
+%% Slots deleted during the aborted compaction are released for reuse: the
+%% record-clobber hazard is over (do_compact has finished), a reused slot's
+%% record is cleared on allocation, and a reused slot gets a new generation so
+%% the deleted owner's stale on-disk WAL entries are skipped on replay.
 -spec abort_compact(state()) -> {ok, state()}.
 abort_compact(#shu{compacting = false} = State) ->
     {ok, State};
@@ -1123,13 +1180,22 @@ replay_pending_wal(Pending, Cfg, Fd, Tab, State) ->
     {State1, IoList} =
         lists:foldl(
           fun(Entry, {S, Acc}) ->
-                  #shu{wal_byte_pos = WBP} = S,
-                  <<SlotIdx:32/unsigned-big, FieldId:8, ValueLen:16/unsigned-big, Rest/binary>> = Entry,
+                  #shu{wal_byte_pos = WBP, slot_gen = SlotGen} = S,
+                  <<SlotIdx:32/unsigned-big, Gen:64/unsigned-big, FieldId:8,
+                    ValueLen:16/unsigned-big, Rest/binary>> = Entry,
                   <<Value:ValueLen/binary, _Crc:32/unsigned-big>> = Rest,
-                  EtsKey = {SlotIdx, FieldId},
-                  true = ets:insert(Tab, {EtsKey, Value}),
-                  S1 = S#shu{wal_byte_pos = WBP + byte_size(Entry)},
-                  {S1, [Entry | Acc]}
+                  case maps:get(SlotIdx, SlotGen, undefined) of
+                      Gen ->
+                          true = ets:insert(Tab, {{SlotIdx, FieldId}, Value}),
+                          S1 = S#shu{wal_byte_pos = WBP + byte_size(Entry)},
+                          {S1, [Entry | Acc]};
+                      _ ->
+                          %% Slot was deleted (dropped from slot_gen) or reused
+                          %% (new generation) since this entry was buffered. Drop
+                          %% it: do not re-cache and do not re-write to disk, so a
+                          %% key that reuses the slot cannot inherit the value.
+                          {S, Acc}
+                  end
           end, {State, []}, Pending),
     case IoList of
         [] -> ok;

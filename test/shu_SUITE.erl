@@ -26,7 +26,8 @@ all() ->
      {group, ra_integration},
      {group, error_paths},
      {group, recovery},
-     {group, migration}].
+     {group, migration},
+     {group, property}].
 
 groups() ->
     [{encoding, [parallel],
@@ -58,6 +59,7 @@ groups() ->
      {deletes, [],
       [delete_key,
        delete_and_reuse_slot,
+       delete_reuse_clears_stale_fields,
        delete_not_found]},
      {wal, [],
       [wal_replay_on_reopen,
@@ -96,11 +98,17 @@ groups() ->
        unknown_field_error]},
      {recovery, [],
       [atom_count_recovery_from_stale_header,
+       crash_recovery_atoms,
+       crash_recovery_reuse_no_resurrection,
+       orphaned_wal_entry_no_gen_reuse,
+       empty_atom_survives_reopen,
        sync_basic]},
      {migration, [],
       [migrate_basic,
        migrate_with_data,
-       migrate_during_compaction]}].
+       migrate_during_compaction]},
+     {property, [],
+      [model_random_sequences]}].
 
 init_per_suite(Config) ->
     Config.
@@ -1156,3 +1164,316 @@ configurable_atom_table_slots(Config) ->
     ?assertMatch({ok, cfg_atom_299}, shu:read(S2, <<299:32/unsigned-big>>, atom_field)),
     ?assertMatch({ok, cfg_atom_0}, shu:read(S2, <<0:32/unsigned-big>>, atom_field)),
     ok = shu:close(S2).
+
+%%% ============================================================
+%%% Randomized model / property tests
+%%% ============================================================
+
+%% Run many randomized sequences of write/delete/compaction operations against
+%% a reference model (a plain map), asserting shu matches the model after every
+%% operation and across a close+reopen. Interleaves writes and deletes inside
+%% the compacting window (where slot-reuse and pending-wal bugs live) and uses a
+%% small WAL to force compaction and backpressure frequently.
+model_random_sequences(Config) ->
+    File = ?config(shu_file, Config),
+    _ = rand:seed(exsss, {19, 87, 2026}),
+    Schema = #{fields => [#{name => f_lo, type => {integer, 64},
+                            frequency => low},
+                          #{name => f_hi, type => {integer, 64},
+                            frequency => high}],
+               key => {binary, 8},
+               expected_count => 20,
+               wal_size => 200},
+    Keys = [model_key(N) || N <- lists:seq(1, 6)],
+    _ = [model_iter(File, Schema, Keys) || _ <- lists:seq(1, 300)],
+    ok.
+
+model_key(N) ->
+    B = integer_to_binary(N),
+    Pad = 8 - byte_size(B),
+    <<0:(Pad * 8), B/binary>>.
+
+model_iter(File, Schema, Keys) ->
+    _ = file:delete(File),
+    {ok, S0} = shu:open(File, Schema),
+    NOps = rand:uniform(60),
+    {S1, Model, Compacting, Work} =
+        run_model_ops(S0, #{}, false, undefined, Keys, NOps),
+    %% finish any in-flight compaction so the store can be closed/reopened
+    S2 = case Compacting of
+             true ->
+                 {ok, Sx} = shu:finish_compact(shu:do_compact(Work), S1),
+                 Sx;
+             false ->
+                 S1
+         end,
+    check_model(S2, Model, Keys, pre_reopen),
+    ok = shu:close(S2),
+    %% persistence: a fresh open must recover exactly the same state
+    {ok, S3} = shu:open(File, Schema),
+    check_model(S3, Model, Keys, post_reopen),
+    ok = shu:close(S3).
+
+run_model_ops(S, Model, Compacting, Work, _Keys, 0) ->
+    {S, Model, Compacting, Work};
+run_model_ops(S, Model, Compacting, Work, Keys, N) ->
+    {S1, Model1, Compacting1, Work1} =
+        model_step(pick_model_op(Compacting), S, Model, Compacting, Work, Keys),
+    %% invariant must hold after every single step, including mid-compaction
+    check_model(S1, Model1, Keys),
+    run_model_ops(S1, Model1, Compacting1, Work1, Keys, N - 1).
+
+pick_model_op(true) ->
+    %% while compacting, bias toward writes/deletes and occasionally finish
+    case rand:uniform(10) of
+        1 -> finish;
+        2 -> delete;
+        3 -> delete;
+        _ -> write
+    end;
+pick_model_op(false) ->
+    case rand:uniform(10) of
+        1 -> start;
+        2 -> delete;
+        3 -> delete;
+        _ -> write
+    end.
+
+model_step(write, S, Model, Compacting, Work, Keys) ->
+    Key = lists:nth(rand:uniform(length(Keys)), Keys),
+    FVs = random_fields(),
+    model_write(S, Model, Compacting, Work, Keys, Key, FVs);
+model_step(delete, S, Model, Compacting, Work, _Keys) ->
+    Key0 = maps:keys(Model),
+    case Key0 of
+        [] ->
+            {S, Model, Compacting, Work};
+        _ ->
+            Key = lists:nth(rand:uniform(length(Key0)), Key0),
+            {ok, S1} = shu:delete(S, Key),
+            {S1, maps:remove(Key, Model), Compacting, Work}
+    end;
+model_step(start, S, Model, false, _Work, _Keys) ->
+    {W, S1} = shu:prepare_compact(S),
+    {S1, Model, true, W};
+model_step(finish, S, Model, true, Work, _Keys) ->
+    {ok, S1} = shu:finish_compact(shu:do_compact(Work), S),
+    {S1, Model, false, undefined};
+model_step(_, S, Model, Compacting, Work, _Keys) ->
+    {S, Model, Compacting, Work}.
+
+%% write, reclaiming the WAL via a full compaction cycle if it is full
+model_write(S, Model, Compacting, Work, Keys, Key, FVs) ->
+    case shu:write(S, Key, FVs) of
+        {ok, S1} ->
+            {S1, update_model(Model, Key, FVs), Compacting, Work};
+        {wal_full, S1} ->
+            S2 = case Compacting of
+                     true ->
+                         {ok, Sx} = shu:finish_compact(shu:do_compact(Work), S1),
+                         Sx;
+                     false ->
+                         {W, Sp} = shu:prepare_compact(S1),
+                         {ok, Sx} = shu:finish_compact(shu:do_compact(W), Sp),
+                         Sx
+                 end,
+            %% WAL reclaimed; retry into the now-empty WAL (not compacting)
+            model_write(S2, Model, false, undefined, Keys, Key, FVs)
+    end.
+
+random_fields() ->
+    Lo = case rand:uniform(5) of
+             1 -> [];
+             2 -> [{f_lo, undefined}];
+             _ -> [{f_lo, rand:uniform(1000000)}]
+         end,
+    Hi = case rand:uniform(5) of
+             1 -> [];
+             2 -> [{f_hi, undefined}];
+             _ -> [{f_hi, rand:uniform(1000000)}]
+         end,
+    case Lo ++ Hi of
+        [] -> [{f_lo, rand:uniform(1000000)}];
+        FVs -> FVs
+    end.
+
+update_model(Model, Key, FVs) ->
+    Cur = maps:get(Key, Model, #{}),
+    New = lists:foldl(fun({F, V}, A) -> A#{F => V} end, Cur, FVs),
+    Model#{Key => New}.
+
+check_model(S, Model, Keys) ->
+    check_model(S, Model, Keys, unspecified).
+
+check_model(S, Model, Keys, Phase) ->
+    lists:foreach(
+      fun(Key) ->
+              Exp = maps:get(Key, Model, undefined),
+              Got = shu:read_all(S, Key),
+              case Exp of
+                  undefined ->
+                      case Got of
+                          error -> ok;
+                          _ -> erlang:error({model_mismatch, Phase, Key,
+                                             expected_absent, Got})
+                      end;
+                  Fields ->
+                      {ok, GotMap} = Got,
+                      ELo = maps:get(f_lo, Fields, undefined),
+                      EHi = maps:get(f_hi, Fields, undefined),
+                      GLo = maps:get(f_lo, GotMap, undefined),
+                      GHi = maps:get(f_hi, GotMap, undefined),
+                      case ELo =:= GLo andalso EHi =:= GHi of
+                          true -> ok;
+                          false ->
+                              erlang:error({model_mismatch, Phase, Key,
+                                            {expected, ELo, EHi},
+                                            {got, GLo, GHi}})
+                      end
+              end
+      end, Keys).
+
+%% Regression: a slot reused after delete must not surface the deleted key's
+%% record-area field values for fields the new key does not write.
+delete_reuse_clears_stale_fields(Config) ->
+    File = ?config(shu_file, Config),
+    %% expected_count 1 forces the second key to reuse the first slot
+    Schema = #{fields => [#{name => a, type => {integer, 64},
+                            frequency => low},
+                          #{name => b, type => {integer, 64},
+                            frequency => high}],
+               key => {binary, 8},
+               expected_count => 1},
+    K1 = <<1:64>>,
+    K2 = <<2:64>>,
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, K1, [{a, 111}, {b, 222}]),
+    {ok, S2} = shu:delete(S1, K1),
+    %% K2 reuses slot 0 and writes only a; b must not be K1's stale 222
+    {ok, S3} = shu:write(S2, K2, [{a, 5}]),
+    ?assertMatch({ok, 5}, shu:read(S3, K2, a)),
+    ?assertMatch({ok, undefined}, shu:read(S3, K2, b)),
+    ok = shu:close(S3),
+    %% and the cleared state must survive a reopen
+    {ok, S4} = shu:open(File, Schema),
+    ?assertMatch({ok, 5}, shu:read(S4, K2, a)),
+    ?assertMatch({ok, undefined}, shu:read(S4, K2, b)),
+    ok = shu:close(S4).
+
+%% Crash recovery for the atom table: atoms written this session must survive a
+%% reopen even without a clean close (which is the only other place the header
+%% atom_count is persisted). Simulates a crash by opening a second state on the
+%% same file without closing the first.
+crash_recovery_atoms(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    Key = make_key(1),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, Key, voted_for, {ra, 'ra@node1'}),
+    %% crash: reopen without closing S1 (no clean header write on that path)
+    {ok, S2} = shu:open(File, Schema),
+    ?assertMatch({ok, {ra, 'ra@node1'}}, shu:read(S2, Key, voted_for)),
+    ok = shu:close(S2),
+    catch shu:close(S1),
+    ok.
+
+%% The confirmed crash-window regression: a high-frequency value written for a
+%% key, deleted during a compaction, then not truncated (crash/abort before
+%% finish), must NOT resurrect onto a key that later reuses the slot - even
+%% across a second crash. The per-slot generation guarantees this: the reused
+%% slot has a higher generation, so the deleted owner's WAL entry is skipped on
+%% replay. Crashes are simulated by opening a fresh state on the same file
+%% without a clean close.
+crash_recovery_reuse_no_resurrection(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = ra_meta_schema(),
+    K1 = make_key(1),
+    K2 = make_key(2),
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, K1, last_applied, 100),
+    {ok, S1b} = shu:sync(S1),
+    %% start a compaction and delete K1 within it (deferred, no truncation)
+    {_Work, S2} = shu:prepare_compact(S1b),
+    {ok, _S3} = shu:delete(S2, K1),
+    %% crash before finish: reopen from disk
+    {ok, S4} = shu:open(File, Schema),
+    ?assertEqual(error, shu:read(S4, K1, last_applied)),
+    %% a new key reuses K1's freed slot and does NOT write last_applied
+    {ok, S5} = shu:write(S4, K2, current_term, 7),
+    %% second crash: reopen
+    {ok, S6} = shu:open(File, Schema),
+    ?assertMatch({ok, 7}, shu:read(S6, K2, current_term)),
+    ?assertMatch({ok, undefined}, shu:read(S6, K2, last_applied)),
+    ok = shu:close(S6),
+    catch shu:close(S5),
+    catch shu:close(S4),
+    catch shu:close(S1b),
+    ok.
+
+%% An empty atom ('') encodes to a zero-length atom-table slot. Recovery must
+%% still load it and every atom after it (the header atom_count is
+%% authoritative), rather than mistaking the zero-length slot for the end of
+%% the table.
+empty_atom_survives_reopen(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [#{name => a, type => {atom, 255}, frequency => low}],
+               key => {binary, 4},
+               expected_count => 10},
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, <<1, 2, 3, 4>>, a, ''),
+    {ok, S2} = shu:write(S1, <<5, 6, 7, 8>>, a, hello),
+    ok = shu:close(S2),
+    {ok, S3} = shu:open(File, Schema),
+    ?assertMatch({ok, ''}, shu:read(S3, <<1, 2, 3, 4>>, a)),
+    ?assertMatch({ok, hello}, shu:read(S3, <<5, 6, 7, 8>>, a)),
+    ok = shu:close(S3).
+
+%% A high-frequency WAL entry is not fsynced, and neither is the key-index write
+%% that records its slot's generation, so a crash can persist the WAL entry
+%% (tagged gen G) while losing the key-index write. next_gen must still advance
+%% past G on recovery (accounting for surviving WAL entries, not just the key
+%% index), otherwise a later allocation could re-issue G and the orphaned entry
+%% would match the reused slot. This simulates that crash by zeroing a slot's
+%% key-index entry on disk while leaving its WAL entry intact.
+orphaned_wal_entry_no_gen_reuse(Config) ->
+    File = ?config(shu_file, Config),
+    Schema = #{fields => [#{name => f, type => {integer, 64}, frequency => high},
+                          #{name => g, type => {integer, 64}, frequency => low}],
+               key => {binary, 8},
+               expected_count => 2},
+    KA = <<1:64>>,
+    KB = <<2:64>>,
+    KC = <<3:64>>,
+    {ok, S0} = shu:open(File, Schema),
+    {ok, S1} = shu:write(S0, KA, [{g, 1}]),      %% slot 0, generation 0
+    {ok, S1b} = shu:sync(S1),
+    {ok, S2} = shu:write(S1b, KB, [{f, 999}]),   %% slot 1, generation 1
+    {ok, _S2b} = shu:sync(S2),                    %% WAL entry {1, gen1, f, 999} durable
+    ok = shu:close(S2),
+    %% Simulate the lost key-index write for slot 1 (its WAL entry survives).
+    ok = zero_key_index_slot(File, 1, 8),
+    {ok, S3} = shu:open(File, Schema),
+    ?assertEqual(error, shu:read(S3, KB, f)),
+    %% KC reuses slot 1 (the only free slot) and never writes f.
+    {ok, S4} = shu:write(S3, KC, [{g, 7}]),
+    {ok, _S4b} = shu:sync(S4),
+    ok = shu:close(S4),
+    {ok, S5} = shu:open(File, Schema),
+    ?assertMatch({ok, 7}, shu:read(S5, KC, g)),
+    %% The orphaned gen-1 entry must NOT resurrect onto KC.
+    ?assertMatch({ok, undefined}, shu:read(S5, KC, f)),
+    ok = shu:close(S5).
+
+%% Zero the key-index entry for SlotIdx on disk, deriving the layout from the
+%% on-disk header so it does not hard-code shu's default constants.
+zero_key_index_slot(File, SlotIdx, MaxKeySize) ->
+    {ok, Fd} = file:open(File, [read, write, raw, binary]),
+    {ok, <<_Magic:4/binary, _Ver:16, _Crc:32, _MaxKey:16, _Rec:32, _Num:32,
+           _Wal:32, AtomSlotSize:16/unsigned-big, _AtomCount:16,
+           AtomTableSlots:16/unsigned-big, _Resv:16>>} = file:pread(Fd, 0, 32),
+    KeyIndexOffset = 32 + AtomTableSlots * AtomSlotSize,
+    KiEntrySize = 10 + MaxKeySize,   %% ?KI_OVERHEAD + max_key_size
+    Pos = KeyIndexOffset + SlotIdx * KiEntrySize,
+    ok = file:pwrite(Fd, Pos, <<0:(KiEntrySize * 8)>>),
+    ok = file:sync(Fd),
+    ok = file:close(Fd).
